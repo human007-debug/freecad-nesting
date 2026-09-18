@@ -39,6 +39,19 @@ AUTOSAVE_ATTRS = [
 ]
 
 
+def _to_bool(value):
+    """QSettings' INI backend (the one actually used on Linux/macOS) doesn't
+    preserve a bare bool's type -- it round-trips as the STRING "true" or
+    "false", and `if "false":` is True in Python (any non-empty string is
+    truthy). AUTOSAVE_ATTRS' checkboxes dodge this by wrapping values in a
+    ["check", value] list (Qt's list serialization IS typed correctly), but
+    theme/dark is a bare bool with no such wrapper, so it needs this
+    explicit parse instead of a plain truthiness check."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes")
+    return bool(value)
+
+
 def _kind(widget):
     if isinstance(widget, QtWidgets.QCheckBox):
         return "check"
@@ -133,8 +146,17 @@ def restore_preferences(window):
         tab = settings.value("window/tab", None)
         if isinstance(tab, int) and 0 <= tab < window.tabs.count():
             window.tabs.setCurrentIndex(tab)
-        dark = settings.value("theme/dark", False)
-        if dark:
-            window.dark_mode_action.setChecked(bool(dark))
+        # Applied unconditionally (not just when it differs from the
+        # QAction's own built-in-unchecked default): nothing else in
+        # startup ever calls apply_theme() otherwise (it's normally only
+        # reached via the action's `toggled` signal), so without this a
+        # session that happens to already match the default would render
+        # with no stylesheet applied at all -- whatever the OS/Qt platform
+        # theme happens to be, not this app's own deliberate light default.
+        dark = _to_bool(settings.value("theme/dark", False))
+        window.dark_mode_action.blockSignals(True)
+        window.dark_mode_action.setChecked(dark)
+        window.dark_mode_action.blockSignals(False)
+        window._set_theme(dark)
     except Exception:
         pass

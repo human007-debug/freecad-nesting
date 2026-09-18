@@ -8,7 +8,8 @@
       "quantity": 50,
       "is_remnant": true,
       "id": "R-001",
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 7.85
     },
     {
       "material": "Mild Steel",
@@ -18,7 +19,8 @@
       "quantity": 50,
       "is_remnant": false,
       "id": null,
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 7.85
     },
     {
       "material": "Stainless 304",
@@ -28,7 +30,8 @@
       "quantity": null,
       "is_remnant": false,
       "id": null,
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 8.0
     }
   ]
 }

@@ -57,6 +57,7 @@ import inventory as inv
 import microjoints as mj
 import commonline
 import part_colors
+import remnant as rem
 
 
 SHEET_FILL = QtGui.QColor("#3d6690")
@@ -64,6 +65,12 @@ SHEET_STROKE = QtGui.QColor("#223a52")
 COMMON_EDGE_COLOR = QtGui.QColor("#ff4fa0")
 
 _MAX_LAYOUT_CANDIDATES = 8
+
+# Display-only -- Price/kg, Scrap price, and every computed financial figure
+# are all just plain floats underneath (no currency-aware math anywhere);
+# this only decides which symbol prefixes them in the UI and report.
+CURRENCY_SYMBOLS = {"INR": "₹", "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥"}
+DEFAULT_CURRENCY = "INR"
 
 
 class SheetPreview(QtWidgets.QWidget):
@@ -333,7 +340,7 @@ class NestingPanel(QtWidgets.QWidget):
         self.sheets = []          # list of PlacedPart lists, one per sheet
         self.sheet_dims = []      # parallel list of (w, h), one per sheet
         self.sheet_job_label = [] # parallel list of "<material>/<thickness>mm" (or "") per sheet
-        self.sheet_prices = []    # parallel list of Optional[float] (StockSheet.price_per_sheet), or None with no inventory
+        self.sheet_prices = []    # parallel list of Optional[float] (StockSheet.material_cost()), or None with no inventory
         self.used_stock = []      # parallel list of the StockSheet each sheet was cut from (None with no inventory)
         self.layout_candidates = []  # last _MAX_CANDIDATES Run Nesting results, newest last
         self._stop_requested = False
@@ -612,6 +619,49 @@ class NestingPanel(QtWidgets.QWidget):
         self.inventory_status.setWordWrap(True)
         inv_box_layout.addLayout(inv_buttons)
         inv_box_layout.addWidget(self.inventory_status)
+
+        self.prefer_remnants = QtWidgets.QCheckBox("Prefer remnants first")
+        self.prefer_remnants.setChecked(True)
+        self.prefer_remnants.setToolTip(
+            "Always use up a matching remnant (offcut from a past job) before cutting into a full sheet, "
+            "even if a full sheet would come out a little cheaper or less wasteful -- burns down scrap "
+            "first, which is what the two checkboxes below already do UNLESS this is on: they rank "
+            "candidate stock by fewest sheets/lowest cost/least waste, and without this could otherwise "
+            "trade away a perfectly usable remnant for a full sheet that merely scores a little better on "
+            "that measure. Uncheck to let those two rank purely on sheets/cost/waste, ignoring remnant "
+            "status entirely."
+        )
+        inv_box_layout.addWidget(self.prefer_remnants)
+
+        pricing_form = QtWidgets.QFormLayout()
+        self.currency = QtWidgets.QComboBox()
+        self.currency.addItems(list(CURRENCY_SYMBOLS.keys()))
+        self.currency.setCurrentText(DEFAULT_CURRENCY)
+        self.currency.setToolTip(
+            "Display only -- every price/cost figure is a plain number underneath, no conversion. "
+            "Just decides which symbol prefixes Price/kg, Scrap price, and the report's Financials section."
+        )
+        pricing_form.addRow("Currency", self.currency)
+
+        self.scrap_price_label = QtWidgets.QLabel()
+        self.scrap_price_per_kg = QtWidgets.QDoubleSpinBox()
+        self.scrap_price_per_kg.setRange(0.0, 100000.0)
+        self.scrap_price_per_kg.setDecimals(2)
+        self.scrap_price_per_kg.setValue(0.0)
+        self.scrap_price_per_kg.setToolTip(
+            "What you're paid per kg for scrapping cut-sheet offcuts too small to keep as a remnant "
+            "(0 = not tracked/not sold). One blended rate for the whole job -- stock's own Price/kg and "
+            "Density (set per entry in the Stock tab) are what make weight/cost figures possible at all; "
+            "an entry missing either is simply left out of the report's financial totals. Used only for "
+            "the report's estimate, never for choosing stock or ranking layouts."
+        )
+        pricing_form.addRow(self.scrap_price_label, self.scrap_price_per_kg)
+        inv_box_layout.addLayout(pricing_form)
+
+        def _update_scrap_price_label(code):
+            self.scrap_price_label.setText(f"Scrap price ({CURRENCY_SYMBOLS.get(code, '')}/kg)")
+        self.currency.currentTextChanged.connect(_update_scrap_price_label)
+        _update_scrap_price_label(self.currency.currentText())
 
         self.joint_stock_optimization = QtWidgets.QCheckBox("Joint stock optimization")
         self.joint_stock_optimization.setToolTip(
@@ -1575,6 +1625,9 @@ class NestingPanel(QtWidgets.QWidget):
                 "margin_left": self.margin_left.value(), "margin_right": self.margin_right.value(),
                 "margin_top": self.margin_top.value(), "margin_bottom": self.margin_bottom.value(),
                 "margin_apply_all": self.margin_apply_all.isChecked(),
+                "prefer_remnants": self.prefer_remnants.isChecked(),
+                "currency": self.currency.currentText(),
+                "scrap_price_per_kg": self.scrap_price_per_kg.value(),
                 "joint_stock_optimization": self.joint_stock_optimization.isChecked(),
                 "true_joint_stock_optimization": self.true_joint_stock_optimization.isChecked(),
                 "ga_population": self.ga_population.value(), "ga_generations": self.ga_generations.value(),
@@ -1629,6 +1682,9 @@ class NestingPanel(QtWidgets.QWidget):
         self.margin_right.setValue(settings.get("margin_right", self.margin_right.value()))
         self.margin_top.setValue(settings.get("margin_top", self.margin_top.value()))
         self.margin_bottom.setValue(settings.get("margin_bottom", self.margin_bottom.value()))
+        self.prefer_remnants.setChecked(settings.get("prefer_remnants", True))
+        self.currency.setCurrentText(settings.get("currency", DEFAULT_CURRENCY))
+        self.scrap_price_per_kg.setValue(settings.get("scrap_price_per_kg", 0.0))
         self.joint_stock_optimization.setChecked(settings.get("joint_stock_optimization", False))
         self.true_joint_stock_optimization.setChecked(settings.get("true_joint_stock_optimization", False))
         self.ga_population.setValue(settings.get("ga_population", self.ga_population.value()))
@@ -1967,6 +2023,7 @@ class NestingPanel(QtWidgets.QWidget):
             working_stock = copy.deepcopy(self._inventory_template)
             results = inv.run_job(parts, working_stock, kerf=self.part_spacing.value(),
                                    joint_stock_optimization=self.joint_stock_optimization.isChecked(),
+                                   prefer_remnants=self.prefer_remnants.isChecked(),
                                    **self._margin_kwargs())
             for r in results:
                 job_label = f"{r.material} / {r.thickness:g} mm"
@@ -1974,7 +2031,7 @@ class NestingPanel(QtWidgets.QWidget):
                     self.sheets.append(sheet)
                     self.sheet_dims.append((stock.width, stock.height))
                     self.sheet_job_label.append(job_label)
-                    self.sheet_prices.append(stock.price_per_sheet)
+                    self.sheet_prices.append(stock.material_cost())
                     self.used_stock.append(stock)
                 self.unplaced.extend(r.unplaced)
                 placed = sum(len(s) for s in r.sheets)
@@ -2100,6 +2157,7 @@ class NestingPanel(QtWidgets.QWidget):
                                        use_ga=True, ga_kwargs=ga_kwargs,
                                        joint_stock_optimization=self.joint_stock_optimization.isChecked(),
                                        true_joint_stock_optimization=self.true_joint_stock_optimization.isChecked(),
+                                       prefer_remnants=self.prefer_remnants.isChecked(),
                                        should_stop=lambda: self._stop_requested,
                                        **self._margin_kwargs())
                 self._last_run_used_ga = True
@@ -2115,7 +2173,7 @@ class NestingPanel(QtWidgets.QWidget):
                         self.sheets.append(sheet)
                         self.sheet_dims.append((stock.width, stock.height))
                         self.sheet_job_label.append(job_label)
-                        self.sheet_prices.append(stock.price_per_sheet)
+                        self.sheet_prices.append(stock.material_cost())
                         self.used_stock.append(stock)
                     self.unplaced.extend(r.unplaced)
                     placed = sum(len(s) for s in r.sheets)
@@ -2185,6 +2243,7 @@ class NestingPanel(QtWidgets.QWidget):
                 use_ga=self._last_run_used_ga, ga_kwargs=self._last_run_ga_kwargs,
                 joint_stock_optimization=self.joint_stock_optimization.isChecked(),
                 true_joint_stock_optimization=self.true_joint_stock_optimization.isChecked(),
+                prefer_remnants=self.prefer_remnants.isChecked(),
                 capture_remnants=self.remnant_capture_enabled.isChecked(),
                 min_remnant_dimension=self.remnant_min_dimension.value(),
                 **self._margin_kwargs(),
@@ -2458,6 +2517,93 @@ class NestingPanel(QtWidgets.QWidget):
             return
         self._write_report_file(path, self._build_report_html())
 
+    def _job_financials(self):
+        """Estimated cost/scrap-value breakdown for the currently shown
+        layout (self.sheets/used_stock). Cost comes from
+        StockSheet.weight_kg()/material_cost() (width x height x thickness
+        x density_g_cm3 x price_per_kg -- see inventory.py) -- an entry
+        missing either density or price simply doesn't contribute, rather
+        than the whole estimate failing.
+
+        A remnant's own material_cost() isn't cash spent this job (it was
+        already on hand) -- it's reported separately as "money saved" by
+        not having to buy that same weight of material new, which is the
+        actual point of `prefer_remnants` existing at all.
+
+        "Scrap value" mirrors the SAME remnant-capture decision
+        commit_job() would actually make for each sheet (same
+        `remnant.largest_empty_rect()` call, same Auto-record-new-remnants
+        checkbox and minimum-dimension setting) so it only values the part
+        of a sheet's waste that would NOT become a new remnant -- i.e.
+        material that's actually sold as scrap or discarded. This is an
+        ESTIMATE: a real Commit could land differently if the inventory
+        file on disk has changed since this layout was previewed.
+
+        Returns a dict of totals; any total with nothing priced behind it
+        is None rather than a misleading 0."""
+        capture_enabled = self.remnant_capture_enabled.isChecked()
+        min_dim = self.remnant_min_dimension.value()
+        scrap_price = self.scrap_price_per_kg.value()
+
+        new_sheets = new_weight = new_cost = 0.0
+        remnant_sheets = remnant_weight = remnant_savings = 0.0
+        scrap_weight = scrap_value = 0.0
+        any_new_priced = any_remnant_priced = any_scrap_priced = False
+
+        used_stock = getattr(self, "used_stock", []) or []
+        for sheet, stock in zip(self.sheets, used_stock):
+            if stock is None:
+                continue
+            weight = stock.weight_kg()
+            cost = stock.material_cost()
+            if stock.is_remnant:
+                remnant_sheets += 1
+                if weight is not None:
+                    remnant_weight += weight
+                if cost is not None:
+                    remnant_savings += cost
+                    any_remnant_priced = True
+            else:
+                new_sheets += 1
+                if weight is not None:
+                    new_weight += weight
+                if cost is not None:
+                    new_cost += cost
+                    any_new_priced = True
+
+            if weight is None or stock.density_g_cm3 is None or not sheet:
+                continue
+            used_weight = (sum(pp.net_area() for pp in sheet) * stock.thickness
+                           * stock.density_g_cm3 / 1e6)
+            waste_weight = max(0.0, weight - used_weight)
+            captured_weight = 0.0
+            if capture_enabled:
+                obstacle_bboxes = [geometry.polygon_bbox(pp.points) for pp in sheet]
+                found = rem.largest_empty_rect(stock.width, stock.height, obstacle_bboxes)
+                if found is not None:
+                    _x, _y, rect_w, rect_h = found
+                    if rect_w >= min_dim and rect_h >= min_dim:
+                        captured_weight = rect_w * rect_h * stock.thickness * stock.density_g_cm3 / 1e6
+            true_scrap = max(0.0, waste_weight - captured_weight)
+            scrap_weight += true_scrap
+            if scrap_price > 0:
+                scrap_value += true_scrap * scrap_price
+                any_scrap_priced = True
+
+        net_cost = None
+        if any_new_priced:
+            net_cost = new_cost - (scrap_value if any_scrap_priced else 0.0)
+
+        return {
+            "new_sheets": int(new_sheets), "new_weight_kg": new_weight,
+            "new_material_cost": new_cost if any_new_priced else None,
+            "remnant_sheets": int(remnant_sheets), "remnant_weight_kg": remnant_weight,
+            "remnant_savings": remnant_savings if any_remnant_priced else None,
+            "scrap_weight_kg": scrap_weight,
+            "scrap_value": scrap_value if any_scrap_priced else None,
+            "net_cost": net_cost,
+        }
+
     def _build_report_html(self):
         """Shared HTML body for both the manual Export Report and the
         automatic post-run report. Reads self.sheets/sheet_dims/used_stock
@@ -2465,6 +2611,7 @@ class NestingPanel(QtWidgets.QWidget):
         preview per sheet plus a stock-consumption section."""
         microjoint_cfg = self._microjoint_cfg()
         common_line_cfg = self._common_line_cfg()
+        currency_symbol = CURRENCY_SYMBOLS.get(self.currency.currentText(), "")
         rows = []
         for i, sheet in enumerate(self.sheets):
             w, h = self.sheet_dims[i]
@@ -2472,7 +2619,13 @@ class NestingPanel(QtWidgets.QWidget):
             util = 100.0 * sum(pp.net_area() for pp in sheet) / area if area > 0 else 0.0
             job_label = self.sheet_job_label[i] or "--"
             price = self.sheet_prices[i] if i < len(self.sheet_prices) else None
-            price_text = f"{price:.2f}" if price is not None else "unpriced"
+            stock_i = self.used_stock[i] if i < len(getattr(self, "used_stock", [])) else None
+            if price is None:
+                price_text = "unpriced"
+            elif stock_i is not None and stock_i.is_remnant:
+                price_text = f"{currency_symbol}{price:,.2f} saved"  # remnant: already on hand, not cash spent this job
+            else:
+                price_text = f"{currency_symbol}{price:,.2f}"
 
             preview = SheetPreview()
             preview.resize(400, 400)
@@ -2497,9 +2650,26 @@ class NestingPanel(QtWidgets.QWidget):
         total_util = 100.0 * used_area / total_area if total_area > 0 else 0.0
         cut_length = self._total_cut_length()
         cut_minutes = cut_length / self.cut_speed.value() if self.cut_speed.value() > 0 else 0.0
-        priced = [p for p in self.sheet_prices if p is not None]
-        cost_text = f"{sum(priced):.2f}" if priced else "n/a (no priced stock used)"
         unplaced_text = ", ".join(self.unplaced) if self.unplaced else "none"
+
+        fin = self._job_financials()
+
+        def money(v):
+            return f"{currency_symbol}{v:,.2f}" if v is not None else "n/a (no priced/densitied stock used)"
+
+        cost_text = money(fin["net_cost"])
+        financials_section = f"""
+<h2>Financials</h2>
+<p>Estimate only, from each stock entry's own Price/kg and Density (Stock tab) plus the Scrap
+price setting -- an entry missing either is left out of these totals rather than guessed at.
+A remnant's cost isn't cash spent this job (it was already on hand); it's shown separately as money
+saved by not buying that weight of material new.</p>
+<ul>
+  <li>New sheets cut: {fin['new_sheets']} ({fin['new_weight_kg']:.1f} kg) -- material cost: {money(fin['new_material_cost'])}</li>
+  <li>Remnants used: {fin['remnant_sheets']} ({fin['remnant_weight_kg']:.1f} kg) -- money saved vs. buying new: {money(fin['remnant_savings'])}</li>
+  <li>Estimated scrap (waste not captured as a new remnant): {fin['scrap_weight_kg']:.1f} kg -- recoverable value: {money(fin['scrap_value'])}</li>
+  <li><strong>Net material cost (new sheets minus scrap value recovered): {cost_text}</strong></li>
+</ul>"""
 
         # Stock consumed/remaining -- only meaningful when this job ran
         # against an inventory (each sheet has a concrete StockSheet behind it).
@@ -2557,13 +2727,14 @@ class NestingPanel(QtWidgets.QWidget):
   <li>Parts placed: {total_placed}</li>
   <li>Overall efficiency: {total_util:.1f}%</li>
   <li>Estimated cut time: {cut_minutes:.1f} min ({cut_length / 1000:.1f} m of cuts)</li>
-  <li>Estimated material cost: {cost_text}</li>
+  <li>Net material cost: {cost_text}</li>
   <li>Unplaced parts: {unplaced_text}</li>
 </ul>
+{financials_section}
 {stock_section}
 <h2>Sheets</h2>
 <table>
-<tr><th>Layout</th><th>#</th><th>Material / Thickness</th><th>Size</th><th>Parts</th><th>Efficiency</th><th>Cost</th></tr>
+<tr><th>Layout</th><th>#</th><th>Material / Thickness</th><th>Size</th><th>Parts</th><th>Efficiency</th><th>Cost/Saved</th></tr>
 {"".join(rows)}
 </table>
 </body></html>"""

@@ -59,13 +59,39 @@ class StockSheet:
     quantity: Optional[int] = None  # None = unlimited (e.g. a standard sheet you can always reorder)
     is_remnant: bool = False
     id: Optional[str] = None
-    price_per_sheet: Optional[float] = None  # what this exact stock size costs, for job-cost estimates --
-                                              # not a weight/density-derived guess (this project doesn't
-                                              # know your suppliers' actual prices or your material's exact
-                                              # alloy density), just whatever you enter; None = unpriced
+    # Sheet metal is bought and priced by WEIGHT, not by the sheet -- so
+    # cost is derived from density + dimensions rather than entered
+    # directly. Both None = unpriced (job-cost estimates degrade to "n/a"
+    # for this entry, same as the old price_per_sheet's None did).
+    price_per_kg: Optional[float] = None    # material cost, currency/kg -- whatever you enter,
+                                             # not a weight/alloy-derived guess
+    density_g_cm3: Optional[float] = None   # e.g. 7.85 mild steel, 8.0 stainless, 2.70 aluminum --
+                                             # needed to turn this entry's own width/height/thickness
+                                             # into a weight; None = this entry's weight/cost can't be
+                                             # computed at all, regardless of price_per_kg
 
     def area(self):
         return self.width * self.height
+
+    def weight_kg(self) -> Optional[float]:
+        """This exact sheet's full weight (width x height x thickness x
+        density_g_cm3, mm and g/cm^3 in, kg out) -- None if density_g_cm3
+        isn't set."""
+        if self.density_g_cm3 is None:
+            return None
+        return self.width * self.height * self.thickness * self.density_g_cm3 / 1e6
+
+    def material_cost(self) -> Optional[float]:
+        """What buying/consuming ONE of this exact stock sheet costs (its
+        full weight x price_per_kg) -- None if either weight or
+        price_per_kg is unknown. For a remnant, this is what it WOULD have
+        cost to buy that same amount of material new -- i.e. "money saved"
+        by using it, not cash actually spent this job (see nesting_widgets.py's
+        job-financials calculation)."""
+        weight = self.weight_kg()
+        if weight is None or self.price_per_kg is None:
+            return None
+        return weight * self.price_per_kg
 
 
 def load_inventory(path) -> List[StockSheet]:
@@ -118,14 +144,17 @@ def candidate_stocks_for(material: str, thickness: float, inventory: List[StockS
 
 
 def best_stock_for(material: str, thickness: float, inventory: List[StockSheet],
-                    min_w: float = 0.0, min_h: float = 0.0) -> Optional[StockSheet]:
-    """Remnants first (use up scrap before cutting into new material), then
-    smallest area that's still big enough for the group's largest part
-    (checked both orientations, since the part may end up rotated)."""
+                    min_w: float = 0.0, min_h: float = 0.0,
+                    prefer_remnants: bool = True) -> Optional[StockSheet]:
+    """Remnants first (use up scrap before cutting into new material) when
+    `prefer_remnants` is set (the default), then smallest area that's still
+    big enough for the group's largest part (checked both orientations,
+    since the part may end up rotated). With `prefer_remnants=False`,
+    remnant status is ignored entirely and this is pure smallest-fit."""
     candidates = candidate_stocks_for(material, thickness, inventory, min_w, min_h)
     if not candidates:
         return None
-    candidates.sort(key=lambda s: (not s.is_remnant, s.area()))
+    candidates.sort(key=lambda s: (prefer_remnants and not s.is_remnant, s.area()))
     return candidates[0]
 
 
@@ -165,17 +194,26 @@ def nest_against_stock(stock: StockSheet, remaining: List[Part], kerf: float,
     return sheets, unplaced_names, note
 
 
-def _stock_objective(stock: StockSheet, sheets: List[List[PlacedPart]]):
-    """Ranking key for joint_stock_optimization: fewer sheets wins; among
-    ties, lower total cost if price_per_sheet is set (unpriced = +inf, so
-    an unpriced candidate never wins a tie against a priced one, but a
-    comparison between two unpriced candidates still falls through to
-    wasted area cleanly); among ties on both, less wasted area."""
+def _stock_objective(stock: StockSheet, sheets: List[List[PlacedPart]], prefer_remnants: bool = True):
+    """Ranking key for joint_stock_optimization. When `prefer_remnants` is
+    set (the default), any remnant candidate outranks any non-remnant one
+    outright, before sheet count/cost/waste are even compared -- matching
+    best_stock_for()'s own always-remnants-first default, so this "smarter,
+    measure every candidate" mode can't quietly trade away a usable remnant
+    for a full sheet that merely scores a little better on cost/waste.
+    Below that (or always, if `prefer_remnants=False`): fewer sheets wins;
+    among ties, lower total cost if `material_cost()` is computable
+    (unpriced = +inf, so an unpriced candidate never wins a tie against a
+    priced one, but a comparison between two unpriced candidates still
+    falls through to wasted area cleanly); among ties on both, less wasted
+    area."""
     n_sheets = len(sheets)
-    cost = n_sheets * stock.price_per_sheet if stock.price_per_sheet is not None else float("inf")
+    per_sheet_cost = stock.material_cost()
+    cost = n_sheets * per_sheet_cost if per_sheet_cost is not None else float("inf")
     used_area = sum(pp.net_area() for s in sheets for pp in s)
     wasted = stock.area() * max(n_sheets, 1) - used_area
-    return (n_sheets, cost, wasted)
+    remnant_rank = 0 if (prefer_remnants and stock.is_remnant) else 1
+    return (remnant_rank, n_sheets, cost, wasted)
 
 
 @dataclass
@@ -222,16 +260,16 @@ def group_bbox(parts: List[Part]) -> Tuple[float, float]:
 def greedy_best_stock_step(material: str, thickness: float, remaining: List[Part],
                             inventory: List[StockSheet], kerf: float, use_ga: bool,
                             ga_kwargs: Optional[dict], nester_kwargs: dict, should_stop,
-                            min_w: float, min_h: float):
+                            min_w: float, min_h: float, prefer_remnants: bool = True):
     """One "which single stock size is actually best for what's left"
     decision -- nests `remaining` against EVERY viable candidate size (not
     just whichever `best_stock_for()`'s static heuristic picks first) and
-    keeps whichever yields the best `_stock_objective()` (fewest sheets,
-    then lowest cost if priced, then least waste). This is the
-    `joint_stock_optimization` algorithm itself; pulled out of run_job()'s
-    cascade loop so stock_solver.py's deeper plan search can reuse the
-    exact same per-step decision as its construction baseline. Returns
-    (stock_or_None, sheets, unplaced_names, note_or_None)."""
+    keeps whichever yields the best `_stock_objective()` (remnants first if
+    `prefer_remnants`, then fewest sheets, then lowest cost if priced, then
+    least waste). This is the `joint_stock_optimization` algorithm itself;
+    pulled out of run_job()'s cascade loop so stock_solver.py's deeper plan
+    search can reuse the exact same per-step decision as its construction
+    baseline. Returns (stock_or_None, sheets, unplaced_names, note_or_None)."""
     candidates = candidate_stocks_for(material, thickness, inventory, min_w, min_h)
     best = None
     for cand in candidates:
@@ -239,7 +277,7 @@ def greedy_best_stock_step(material: str, thickness: float, remaining: List[Part
             break
         cand_sheets, cand_unplaced, cand_note = nest_against_stock(
             cand, remaining, kerf, use_ga, ga_kwargs, nester_kwargs, should_stop)
-        obj = _stock_objective(cand, cand_sheets)
+        obj = _stock_objective(cand, cand_sheets, prefer_remnants)
         if best is None or obj < best[0]:
             best = (obj, cand, cand_sheets, cand_unplaced, cand_note)
     if best is None:
@@ -251,11 +289,21 @@ def greedy_best_stock_step(material: str, thickness: float, remaining: List[Part
 def run_job(parts: List[Part], inventory: List[StockSheet], kerf: float = 0.0,
             max_stock_switches: int = 20, use_ga: bool = False, ga_kwargs: Optional[dict] = None,
             joint_stock_optimization: bool = False, true_joint_stock_optimization: bool = False,
-            should_stop=None, **nester_kwargs) -> List[JobResult]:
+            prefer_remnants: bool = True, should_stop=None, **nester_kwargs) -> List[JobResult]:
     """One JobResult per (material, thickness) group found in `parts`.
     Within a group, cascades from best-matching stock to the next as each
     one is exhausted (geometrically or by on-hand quantity) -- see module
     docstring.
+
+    `prefer_remnants` (default True) makes remnants always outrank full
+    sheets when choosing stock, REGARDLESS of which of the three modes
+    below picks the candidate -- `best_stock_for()`'s default heuristic
+    already did this; without threading it through here too,
+    `joint_stock_optimization`/`true_joint_stock_optimization` could
+    silently override it by picking a full sheet that merely scores a
+    little better on sheets/cost/waste than a perfectly usable remnant.
+    Set False to let those two modes rank candidates purely on
+    sheets/cost/waste, ignoring remnant status entirely.
 
     If `use_ga` is set, each pass against a stock size runs
     `genetic.optimize_order()` instead of plain `Nester.run()` -- i.e. one
@@ -272,9 +320,9 @@ def run_job(parts: List[Part], inventory: List[StockSheet], kerf: float = 0.0,
     remaining parts against EVERY viable stock size for the group (not
     just whichever `best_stock_for()`'s remnants-first/smallest-first
     heuristic picks first) and keeps whichever candidate actually yields
-    the best result -- fewest sheets, then lowest total cost if
-    `price_per_sheet` is set, then least wasted area (see
-    `_stock_objective()`). HONEST COST: this multiplies the number of full
+    the best result -- fewest sheets, then lowest total material cost if
+    `price_per_kg`/`density_g_cm3` are set (see `StockSheet.material_cost()`
+    and `_stock_objective()`). HONEST COST: this multiplies the number of full
     nesting passes (or full GA searches, if `use_ga` is also set) by
     however many candidate stock sizes exist for the group, per cascade
     step -- meaningfully slower than the default heuristic, which only
@@ -309,7 +357,8 @@ def run_job(parts: List[Part], inventory: List[StockSheet], kerf: float = 0.0,
             sheets, sheet_stock, unplaced_names, notes = stock_solver.optimize_stock_plan(
                 material, thickness, group, inventory, kerf=kerf, use_ga=use_ga,
                 ga_kwargs=ga_kwargs, nester_kwargs=nester_kwargs,
-                max_stock_switches=max_stock_switches, should_stop=should_stop,
+                max_stock_switches=max_stock_switches, prefer_remnants=prefer_remnants,
+                should_stop=should_stop,
             )
             result.sheets, result.sheet_stock = sheets, sheet_stock
             result.unplaced, result.notes = unplaced_names, notes
@@ -338,9 +387,9 @@ def run_job(parts: List[Part], inventory: List[StockSheet], kerf: float = 0.0,
             if joint_stock_optimization:
                 stock, sheets, unplaced_names, note = greedy_best_stock_step(
                     material, thickness, remaining, inventory, kerf, use_ga,
-                    ga_kwargs, nester_kwargs, should_stop, min_w, min_h)
+                    ga_kwargs, nester_kwargs, should_stop, min_w, min_h, prefer_remnants)
             else:
-                stock = best_stock_for(material, thickness, inventory, min_w, min_h)
+                stock = best_stock_for(material, thickness, inventory, min_w, min_h, prefer_remnants)
                 sheets, unplaced_names, note = (
                     nest_against_stock(stock, remaining, kerf, use_ga, ga_kwargs, nester_kwargs, should_stop)
                     if stock is not None else (None, None, None)
@@ -389,7 +438,7 @@ def _stock_key(s: StockSheet) -> str:
 def commit_job(parts: List[Part], inventory_path: str, kerf: float = 0.0,
                log_path: Optional[str] = None, use_ga: bool = False,
                ga_kwargs: Optional[dict] = None, joint_stock_optimization: bool = False,
-               true_joint_stock_optimization: bool = False,
+               true_joint_stock_optimization: bool = False, prefer_remnants: bool = True,
                capture_remnants: bool = True,
                min_remnant_dimension: float = 100.0, **nester_kwargs) -> List[JobResult]:
     """Like run_job(), but for real: loads inventory fresh from
@@ -417,7 +466,8 @@ def commit_job(parts: List[Part], inventory_path: str, kerf: float = 0.0,
     stock = load_inventory(inventory_path)
     results = run_job(parts, stock, kerf=kerf, use_ga=use_ga, ga_kwargs=ga_kwargs,
                        joint_stock_optimization=joint_stock_optimization,
-                       true_joint_stock_optimization=true_joint_stock_optimization, **nester_kwargs)
+                       true_joint_stock_optimization=true_joint_stock_optimization,
+                       prefer_remnants=prefer_remnants, **nester_kwargs)
 
     new_remnants: List[StockSheet] = []
     if capture_remnants:
@@ -436,6 +486,11 @@ def commit_job(parts: List[Part], inventory_path: str, kerf: float = 0.0,
                     material=r.material, thickness=r.thickness,
                     width=rem_w, height=rem_h, quantity=1, is_remnant=True,
                     id=f"REM-{r.material}-{uuid.uuid4().hex[:8]}",
+                    # Same material as the sheet it was cut from, so the
+                    # same rate applies -- lets a later job value "money
+                    # saved" by using this remnant instead of buying new
+                    # (see nesting_widgets.py's job-financials calculation).
+                    price_per_kg=s.price_per_kg, density_g_cm3=s.density_g_cm3,
                 )
                 stock.append(remnant)
                 new_remnants.append(remnant)

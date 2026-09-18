@@ -368,6 +368,48 @@ FreeCAD workbench regression run confirming the cut-time estimate works
 there identically (cost naturally doesn't apply without inventory in that
 test, matching expectations).
 
+**Later revised: weight/density-based pricing, plus scrap value.** Step
+13's reasoning above (no reliable way to know density/pricing, a wrong
+guess is worse than none) held as long as the software would have had to
+guess those values itself. It doesn't need to: real sheet-metal purchasing
+is priced per kg, not per sheet, and the shop owner already knows both
+numbers for their own materials -- `price_per_sheet` became `price_per_kg`
++ `density_g_cm3` on `StockSheet` (both still `None` = unpriced, same
+graceful degradation as before, just two fields instead of one; see
+`StockSheet.weight_kg()`/`material_cost()`). This is a breaking change to
+`inventory.json`'s schema, not an additive one -- `examples/inventory.json`
+and this project's own `my_inventory.json` were migrated (empty
+`price_per_kg`, densities filled in for their real named materials: 7.85
+mild steel, 8.0 stainless 304, 2.68 aluminum 5052 -- physical constants,
+safe to fill in even though $/kg rates aren't).
+
+A remnant created by `commit_job()`'s auto-capture now inherits its parent
+sheet's `price_per_kg`/`density_g_cm3` (same material, same rate) -- not so
+its own cost counts as cash spent (it doesn't; it was already on hand),
+but so a LATER job can report what using it saved vs. buying that weight
+new. A new **Scrap price (per kg)** setting (Stock tab) prices the OTHER
+side of the ledger: whatever a cut sheet's leftover material doesn't
+become a new remnant (too small to keep, by the same
+`Auto-record-new-remnants` toggle and minimum-dimension threshold
+`commit_job()` already used) is valued as sellable/discarded scrap
+instead. A **Currency** dropdown (INR/USD/EUR/GBP/JPY, defaulting to INR)
+sits next to it -- display-only, every figure underneath is a plain
+number with no conversion, it just decides which symbol prefixes
+Price/kg, Scrap price, and the report. The report's new "Financials"
+section lays out new-sheet cost, remnant savings, and scrap value as three
+separate lines plus a net figure, rather than collapsing them into one
+number that would hide which lever actually moved it.
+
+**Verified**: `StockSheet.weight_kg()`/`material_cost()` checked against a
+hand-computed width x height x thickness x density x price formula, and
+confirmed `None` whenever either density or price is missing rather than
+silently defaulting to 0; `joint_stock_optimization` end-to-end confirmed
+to rank two full-sheet candidates by actual computed cost, not just
+per-kg rate (a smaller/thinner-but-pricier-per-kg sheet can still lose to
+a cheaper one); a real `commit_job()` remnant-capture run confirmed the
+new remnant entry inherits its parent's price/density. See
+`tests/test_stock_pricing.py`.
+
 **Step 14 — part labeling: done.** Fifth item on the list. A new "Part
 labeling (optional)" toggle adds a plain `TEXT` DXF entity (the part's
 name) at each part's bounding-box center, on its own `<part>_LABEL` layer,
@@ -423,8 +465,9 @@ parts against **every** viable stock size for the group (via the new
 `_candidate_stocks_for()`/`_nest_against_stock()`/`_stock_objective()`
 helpers — the same nesting-or-GA call either way, just refactored out of
 the main loop rather than duplicated) and keep whichever candidate
-actually yields fewest sheets, then lowest total cost if `price_per_sheet`
-is set (Step 13), then least wasted area. **Honest cost**: multiplies
+actually yields fewest sheets, then lowest total cost if priced (Step 13;
+`price_per_sheet` there later became weight-derived `material_cost()` --
+see "Later revised" above), then least wasted area. **Honest cost**: multiplies
 nesting passes (or full GA searches) by however many candidate sizes
 exist, per cascade step. **Honest limitation, unchanged from before**:
 still not a true joint solve across *mixed* sizes in one pass (e.g. "2 of
@@ -1425,8 +1468,9 @@ this:
    5mm stainless bracket from the same sheet.
 2. **Stock matching**: `best_stock_for()` picks the best-matching stock
    sheet for a group from an inventory list — remnants before full sheets
-   (burn down scrap before cutting new material), then the smallest size
-   that's still big enough for the group's largest part.
+   (burn down scrap before cutting new material) when `prefer_remnants` is
+   set (the default), then the smallest size that's still big enough for
+   the group's largest part.
 3. **Cascading**: `run_job()` nests a group onto its best-matching stock,
    and whatever doesn't fit — either geometrically, or because that
    stock's on-hand quantity ran out — cascades to the next-best matching
@@ -1466,14 +1510,19 @@ commit_job(parts, "inventory.json", kerf=3.0)
 ```json
 {"stock": [
   {"id": "R-001", "material": "Mild Steel", "thickness": 2.0,
-   "width": 300, "height": 200, "quantity": 1, "is_remnant": true},
+   "width": 300, "height": 200, "quantity": 1, "is_remnant": true,
+   "price_per_kg": null, "density_g_cm3": 7.85},
   {"material": "Mild Steel", "thickness": 2.0,
-   "width": 1220, "height": 2440, "quantity": 3, "is_remnant": false}
+   "width": 1220, "height": 2440, "quantity": 3, "is_remnant": false,
+   "price_per_kg": 1.85, "density_g_cm3": 7.85}
 ]}
 ```
 `quantity: null` means unlimited (e.g. a standard sheet you can always
 reorder); a remnant's `quantity` is however many of that exact offcut are
-actually sitting in the shop.
+actually sitting in the shop. `price_per_kg`/`density_g_cm3` are both
+optional (`null` = unpriced, same graceful degradation as a missing
+quantity) -- see the "Later revised" note under Step 13 for why cost is
+weight-derived rather than a flat per-sheet price.
 
 The workbench UI has this built in: give each row in the parts table a
 Material (defaults to "unspecified" — there's no way to derive material
@@ -1499,6 +1548,19 @@ the way a joint solver could) — see `inventory.py`'s docstring. The
 **"Search size combinations (slower)"** checkbox (Step 22) closes this via
 `stock_solver.py`'s heuristic plan search; it's opt-in rather than the
 default because of its honest compounding cost with the GA.
+
+**"Prefer remnants first"** (checked by default) is what actually
+guarantees remnants get used up before new material regardless of which of
+the three stock-selection modes is active. `best_stock_for()`'s own
+smallest-fit heuristic always preferred remnants outright, but
+"Joint stock optimization" and "Search size combinations" both rank
+candidate stock by fewest sheets/lowest cost/least waste instead — without
+this flag, either could silently swap a perfectly usable remnant for a
+full sheet that merely scored a little better on that measure. Threaded
+through `best_stock_for()`, `greedy_best_stock_step()`
+(`joint_stock_optimization`'s algorithm), and `stock_solver.py`'s hill-climb
+cost function alike, so unchecking it means all three rank purely on
+sheets/cost/waste, ignoring remnant status entirely.
 
 ### Not done yet
 

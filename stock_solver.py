@@ -112,20 +112,34 @@ def _evaluate_plan(plan: List["inventory.StockSheet"], parts: List[Part],
 
 
 def _plan_cost(placed_sheets: List[List[PlacedPart]], sheet_stock: List["inventory.StockSheet"],
-               unplaced_names: List[str]) -> Tuple[int, int, float, float]:
-    """Lexicographic (unplaced_count, sheets_used, total_cost, wasted_area)
-    -- unplaced comes first because leaving parts uncut is worse than any
-    cost/waste difference; cost is +inf if any sheet used is unpriced, so a
-    fully-priced plan always wins a tie against a partially-priced one, and
-    two all-unpriced plans still fall through to comparing wasted area."""
+               unplaced_names: List[str], prefer_remnants: bool = True) -> Tuple[int, int, int, float, float]:
+    """Lexicographic (unplaced_count, non_remnant_sheets, sheets_used,
+    total_cost, wasted_area) -- unplaced comes first because leaving parts
+    uncut is worse than any cost/waste difference; cost is +inf if any
+    sheet used is unpriced, so a fully-priced plan always wins a tie
+    against a partially-priced one, and two all-unpriced plans still fall
+    through to comparing wasted area.
+
+    `non_remnant_sheets` (count of plan slots that are NOT a remnant, 0 when
+    `prefer_remnants` is False) sits right after unplaced_count and before
+    sheets_used/cost/waste -- a plan that uses more remnants always beats
+    one that uses fewer, regardless of any cost/waste difference, matching
+    inventory.py's own always-remnants-first default (see its
+    `_stock_objective()`). Without this, hill-climbing could quietly
+    trade a usable remnant for a full sheet that merely scores a little
+    better on cost/waste -- exactly the failure mode `prefer_remnants`
+    exists to prevent, and this search's neighbor moves (`_random_neighbor`)
+    don't know or care about remnant status themselves, so the cost
+    function is the only place this preference can actually be enforced."""
     n_unplaced = len(unplaced_names)
     n_sheets = len(placed_sheets)
-    priced = bool(sheet_stock) and all(s.price_per_sheet is not None for s in sheet_stock)
-    cost = sum(s.price_per_sheet for s in sheet_stock) if priced else float("inf")
+    non_remnant_sheets = sum(1 for s in sheet_stock if not s.is_remnant) if prefer_remnants else 0
+    priced = bool(sheet_stock) and all(s.material_cost() is not None for s in sheet_stock)
+    cost = sum(s.material_cost() for s in sheet_stock) if priced else float("inf")
     used_area = sum(pp.net_area() for sheet in placed_sheets for pp in sheet)
     total_area = sum(s.area() for s in sheet_stock)
     wasted = total_area - used_area
-    return (n_unplaced, n_sheets, cost, wasted)
+    return (n_unplaced, non_remnant_sheets, n_sheets, cost, wasted)
 
 
 def _plan_respects_quantities(plan: List["inventory.StockSheet"]) -> bool:
@@ -167,7 +181,7 @@ def _random_neighbor(plan: List["inventory.StockSheet"], material: str, thicknes
 def _construct_greedy_plan(material: str, thickness: float, parts: List[Part],
                             stock_inventory: List["inventory.StockSheet"], kerf: float, use_ga: bool,
                             ga_kwargs: Optional[dict], nester_kwargs: dict, should_stop,
-                            max_stock_switches: int):
+                            max_stock_switches: int, prefer_remnants: bool = True):
     """Repeats `inventory.greedy_best_stock_step()` -- the exact algorithm
     `joint_stock_optimization` already runs per cascade step -- recording
     each step's chosen StockSheet into an explicit plan list as it goes.
@@ -189,7 +203,7 @@ def _construct_greedy_plan(material: str, thickness: float, parts: List[Part],
         min_w, min_h = inventory.group_bbox(remaining)
         stock, sheets, unplaced_names, note = inventory.greedy_best_stock_step(
             material, thickness, remaining, stock_inventory, kerf, use_ga,
-            ga_kwargs, nester_kwargs, should_stop, min_w, min_h)
+            ga_kwargs, nester_kwargs, should_stop, min_w, min_h, prefer_remnants)
         if stock is None:
             break
         if note:
@@ -211,6 +225,7 @@ def optimize_stock_plan(material: str, thickness: float, parts: List[Part],
                          use_ga: bool = False, ga_kwargs: Optional[dict] = None,
                          nester_kwargs: Optional[dict] = None, max_stock_switches: int = 20,
                          time_budget_seconds: Optional[float] = 20.0, max_iterations: int = 200,
+                         prefer_remnants: bool = True,
                          seed: Optional[int] = None, should_stop: Optional[Callable[[], bool]] = None):
     """Searches for a good ordered PLAN of specific stock sheets (possibly
     mixed sizes) to cut `parts` (one (material, thickness) group) from as a
@@ -218,15 +233,21 @@ def optimize_stock_plan(material: str, thickness: float, parts: List[Part],
     per-pass single-size cascade. See module docstring for the algorithm
     and its honest scope/cost. Returns (sheets, sheet_stock, unplaced_names,
     notes) -- the same shape `inventory.run_job()`'s cascade loop already
-    accumulates into a JobResult."""
+    accumulates into a JobResult.
+
+    `prefer_remnants` (default True, forwarded to both the construction
+    baseline and `_plan_cost()`) keeps this search from undoing
+    inventory.py's always-remnants-first default in the name of a
+    marginally cheaper/less-wasteful all-full-sheet plan -- see
+    `_plan_cost()`'s docstring."""
     nester_kwargs = nester_kwargs or {}
     template_by_name = {p.name: p for p in parts}
     rng = random.Random(seed)
 
     plan, best_sheets, best_sheet_stock, best_unplaced, best_notes = _construct_greedy_plan(
         material, thickness, parts, stock_inventory, kerf, use_ga, ga_kwargs, nester_kwargs,
-        should_stop, max_stock_switches)
-    best_cost = _plan_cost(best_sheets, best_sheet_stock, best_unplaced)
+        should_stop, max_stock_switches, prefer_remnants)
+    best_cost = _plan_cost(best_sheets, best_sheet_stock, best_unplaced, prefer_remnants)
 
     if len(plan) < 2:
         return best_sheets, best_sheet_stock, best_unplaced, best_notes
@@ -247,7 +268,7 @@ def optimize_stock_plan(material: str, thickness: float, parts: List[Part],
 
         n_sheets, n_stock, n_unplaced, n_notes = _evaluate_plan(
             neighbor, parts, template_by_name, kerf, use_ga, ga_kwargs, nester_kwargs, should_stop)
-        n_cost = _plan_cost(n_sheets, n_stock, n_unplaced)
+        n_cost = _plan_cost(n_sheets, n_stock, n_unplaced, prefer_remnants)
 
         if n_cost < current_cost:
             current_plan, current_cost = neighbor, n_cost

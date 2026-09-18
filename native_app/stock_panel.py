@@ -32,9 +32,10 @@ def check_clear_password(password):
 
 
 COLUMNS = ["ID", "Material", "Thickness (mm)", "Width (mm)", "Height (mm)", "Quantity (blank=unlimited)",
-           "Remnant", "Price/sheet (blank=unpriced)"]
-_REMNANT_COL = len(COLUMNS) - 2
-_PRICE_COL = len(COLUMNS) - 1
+           "Remnant", "Price/kg (blank=unpriced)", "Density g/cm³ (blank=unpriced)"]
+_REMNANT_COL = len(COLUMNS) - 3
+_PRICE_COL = len(COLUMNS) - 2
+_DENSITY_COL = len(COLUMNS) - 1
 
 
 class StockPanel(QtWidgets.QWidget):
@@ -150,8 +151,10 @@ class StockPanel(QtWidgets.QWidget):
         remnant_item = QtWidgets.QTableWidgetItem()
         remnant_item.setCheckState(QtCore.Qt.Checked if s.is_remnant else QtCore.Qt.Unchecked)
         self.table.setItem(row, _REMNANT_COL, remnant_item)
-        price_text = "" if s.price_per_sheet is None else str(s.price_per_sheet)
+        price_text = "" if s.price_per_kg is None else str(s.price_per_kg)
         self.table.setItem(row, _PRICE_COL, QtWidgets.QTableWidgetItem(price_text))
+        density_text = "" if s.density_g_cm3 is None else str(s.density_g_cm3)
+        self.table.setItem(row, _DENSITY_COL, QtWidgets.QTableWidgetItem(density_text))
 
     # --------------------------------------------------------------- edits
 
@@ -174,6 +177,7 @@ class StockPanel(QtWidgets.QWidget):
         for row in range(self.table.rowCount()):
             qty_text = text(row, 5)
             price_text = text(row, _PRICE_COL)
+            density_text = text(row, _DENSITY_COL)
             remnant_item = self.table.item(row, _REMNANT_COL)
             stock.append(inventory.StockSheet(
                 id=text(row, 0) or None,
@@ -183,7 +187,8 @@ class StockPanel(QtWidgets.QWidget):
                 height=float(text(row, 4) or 0),
                 quantity=None if qty_text == "" else int(qty_text),
                 is_remnant=bool(remnant_item and remnant_item.checkState() == QtCore.Qt.Checked),
-                price_per_sheet=None if price_text == "" else float(price_text),
+                price_per_kg=None if price_text == "" else float(price_text),
+                density_g_cm3=None if density_text == "" else float(density_text),
             ))
         return stock
 

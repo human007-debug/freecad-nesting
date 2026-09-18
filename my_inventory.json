@@ -8,7 +8,8 @@
       "quantity": 100,
       "is_remnant": true,
       "id": "R-001",
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 7.85
     },
     {
       "material": "Mild Steel",
@@ -18,7 +19,8 @@
       "quantity": 100,
       "is_remnant": true,
       "id": "R-002",
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 7.85
     },
     {
       "material": "Mild Steel",
@@ -28,7 +30,8 @@
       "quantity": 100,
       "is_remnant": false,
       "id": null,
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 7.85
     },
     {
       "material": "Mild Steel",
@@ -38,7 +41,8 @@
       "quantity": 3,
       "is_remnant": false,
       "id": null,
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 7.85
     },
     {
       "material": "Stainless 304",
@@ -48,7 +52,8 @@
       "quantity": 4,
       "is_remnant": false,
       "id": null,
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 8.0
     },
     {
       "material": "Stainless 304",
@@ -58,7 +63,8 @@
       "quantity": null,
       "is_remnant": false,
       "id": null,
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 8.0
     },
     {
       "material": "Aluminum 5052",
@@ -68,7 +74,8 @@
       "quantity": 2,
       "is_remnant": false,
       "id": null,
-      "price_per_sheet": null
+      "price_per_kg": null,
+      "density_g_cm3": 2.68
     }
   ]
 }

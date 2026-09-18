@@ -69,6 +69,11 @@ class StockSheet:
                                              # needed to turn this entry's own width/height/thickness
                                              # into a weight; None = this entry's weight/cost can't be
                                              # computed at all, regardless of price_per_kg
+    scrap_price_per_kg: Optional[float] = None  # what THIS material's offcuts sell for/kg -- per
+                                                 # entry, not a single blended rate, since scrap value
+                                                 # genuinely varies a lot by material (aluminum scrap is
+                                                 # worth much more per kg than mild steel, for example).
+                                                 # None = this entry's scrap isn't valued in reports.
 
     def area(self):
         return self.width * self.height
@@ -487,10 +492,12 @@ def commit_job(parts: List[Part], inventory_path: str, kerf: float = 0.0,
                     width=rem_w, height=rem_h, quantity=1, is_remnant=True,
                     id=f"REM-{r.material}-{uuid.uuid4().hex[:8]}",
                     # Same material as the sheet it was cut from, so the
-                    # same rate applies -- lets a later job value "money
-                    # saved" by using this remnant instead of buying new
-                    # (see nesting_widgets.py's job-financials calculation).
+                    # same rates apply -- lets a later job value "money
+                    # saved" by using this remnant instead of buying new,
+                    # and value ITS OWN eventual offcuts as scrap too (see
+                    # nesting_widgets.py's job-financials calculation).
                     price_per_kg=s.price_per_kg, density_g_cm3=s.density_g_cm3,
+                    scrap_price_per_kg=s.scrap_price_per_kg,
                 )
                 stock.append(remnant)
                 new_remnants.append(remnant)

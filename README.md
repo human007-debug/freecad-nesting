@@ -384,21 +384,33 @@ mild steel, 8.0 stainless 304, 2.68 aluminum 5052 -- physical constants,
 safe to fill in even though $/kg rates aren't).
 
 A remnant created by `commit_job()`'s auto-capture now inherits its parent
-sheet's `price_per_kg`/`density_g_cm3` (same material, same rate) -- not so
-its own cost counts as cash spent (it doesn't; it was already on hand),
-but so a LATER job can report what using it saved vs. buying that weight
-new. A new **Scrap price (per kg)** setting (Stock tab) prices the OTHER
-side of the ledger: whatever a cut sheet's leftover material doesn't
-become a new remnant (too small to keep, by the same
-`Auto-record-new-remnants` toggle and minimum-dimension threshold
-`commit_job()` already used) is valued as sellable/discarded scrap
-instead. A **Currency** dropdown (INR/USD/EUR/GBP/JPY, defaulting to INR)
-sits next to it -- display-only, every figure underneath is a plain
-number with no conversion, it just decides which symbol prefixes
-Price/kg, Scrap price, and the report. The report's new "Financials"
-section lays out new-sheet cost, remnant savings, and scrap value as three
-separate lines plus a net figure, rather than collapsing them into one
-number that would hide which lever actually moved it.
+sheet's `price_per_kg`/`density_g_cm3`/`scrap_price_per_kg` (same
+material, same rates) -- not so its own cost counts as cash spent (it
+doesn't; it was already on hand), but so a LATER job can report what using
+it saved vs. buying that weight new. A new `scrap_price_per_kg` field on
+`StockSheet` itself (not a single blended job-wide rate -- scrap value
+genuinely varies a lot by material, aluminum scrap being worth far more
+per kg than mild steel's, for example) prices the OTHER side of the
+ledger: whatever a cut sheet's leftover material doesn't become a new
+remnant (too small to keep, by the same `Auto-record-new-remnants` toggle
+and minimum-dimension threshold `commit_job()` already used) is valued as
+sellable/discarded scrap instead, at THAT entry's own rate. The report's
+new "Financials" section lays out new-sheet cost, remnant savings, and
+scrap value as three separate lines plus a net figure, rather than
+collapsing them into one number that would hide which lever actually
+moved it.
+
+Both `scrap_price_per_kg` and a **Currency** dropdown (INR/USD/EUR/GBP/JPY,
+defaulting to INR, display-only -- every figure underneath is a plain
+number with no conversion) live in the native app's Stock tab, not the
+Nesting ribbon: `scrap_price_per_kg` as a column on the inventory table
+right alongside Price/kg and Density (same reasoning -- it's a property of
+the material, not the job), and Currency as a small picker next to
+Load/Clear Inventory. `NestingPanel` (shared with the FreeCAD workbench)
+holds `currency_code` as a plain attribute with a `set_currency()`
+setter/`currency_changed` signal rather than owning the combobox itself,
+since the workbench has no separate Stock tab to put one in -- it just
+stays at the INR default there for now.
 
 **Verified**: `StockSheet.weight_kg()`/`material_cost()` checked against a
 hand-computed width x height x thickness x density x price formula, and
@@ -1511,18 +1523,20 @@ commit_job(parts, "inventory.json", kerf=3.0)
 {"stock": [
   {"id": "R-001", "material": "Mild Steel", "thickness": 2.0,
    "width": 300, "height": 200, "quantity": 1, "is_remnant": true,
-   "price_per_kg": null, "density_g_cm3": 7.85},
+   "price_per_kg": null, "density_g_cm3": 7.85, "scrap_price_per_kg": null},
   {"material": "Mild Steel", "thickness": 2.0,
    "width": 1220, "height": 2440, "quantity": 3, "is_remnant": false,
-   "price_per_kg": 1.85, "density_g_cm3": 7.85}
+   "price_per_kg": 1.85, "density_g_cm3": 7.85, "scrap_price_per_kg": 0.35}
 ]}
 ```
 `quantity: null` means unlimited (e.g. a standard sheet you can always
 reorder); a remnant's `quantity` is however many of that exact offcut are
-actually sitting in the shop. `price_per_kg`/`density_g_cm3` are both
-optional (`null` = unpriced, same graceful degradation as a missing
-quantity) -- see the "Later revised" note under Step 13 for why cost is
-weight-derived rather than a flat per-sheet price.
+actually sitting in the shop. `price_per_kg`/`density_g_cm3`/
+`scrap_price_per_kg` are all optional (`null` = unpriced, same graceful
+degradation as a missing quantity) and all per ENTRY, not a single
+job-wide rate -- see the "Later revised" note under Step 13 for why cost
+is weight-derived rather than a flat per-sheet price, and why scrap value
+is priced per material too.
 
 The workbench UI has this built in: give each row in the parts table a
 Material (defaults to "unspecified" — there's no way to derive material

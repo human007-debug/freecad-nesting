@@ -314,6 +314,9 @@ class NestingPanel(QtWidgets.QWidget):
                                          # readouts (the ribbon's Layout optimization / Estimate boxes) mirror it
     preflight_ready = QtCore.Signal(bool)  # fires whenever the parts-level preflight gate changes -- lets the
                                            # app disable Run Nesting / Commit / Export / Report until parts pass
+    currency_changed = QtCore.Signal(str)  # fires whenever currency_code changes (set_currency(), or a job
+                                            # load restoring one) -- e.g. for a Stock tab's currency picker to
+                                            # stay in sync when the change came from somewhere else
 
     def __init__(self, part_source, parent=None, show_actions=True, settings_in_ribbon=False):
         super().__init__(parent)
@@ -342,6 +345,13 @@ class NestingPanel(QtWidgets.QWidget):
         self.sheet_job_label = [] # parallel list of "<material>/<thickness>mm" (or "") per sheet
         self.sheet_prices = []    # parallel list of Optional[float] (StockSheet.material_cost()), or None with no inventory
         self.used_stock = []      # parallel list of the StockSheet each sheet was cut from (None with no inventory)
+        # Display only -- decides which symbol prefixes Price/kg, Scrap
+        # price, and the report's Financials section; every figure
+        # underneath is a plain number, no conversion. No widget of its own
+        # on this panel -- the native app's Stock tab owns the picker (see
+        # StockPanel) and calls set_currency(); the FreeCAD workbench has
+        # no stock-editing UI at all yet, so it stays at the default there.
+        self.currency_code = DEFAULT_CURRENCY
         self.layout_candidates = []  # last _MAX_CANDIDATES Run Nesting results, newest last
         self._stop_requested = False
         self._search_started_at = None
@@ -632,36 +642,6 @@ class NestingPanel(QtWidgets.QWidget):
             "status entirely."
         )
         inv_box_layout.addWidget(self.prefer_remnants)
-
-        pricing_form = QtWidgets.QFormLayout()
-        self.currency = QtWidgets.QComboBox()
-        self.currency.addItems(list(CURRENCY_SYMBOLS.keys()))
-        self.currency.setCurrentText(DEFAULT_CURRENCY)
-        self.currency.setToolTip(
-            "Display only -- every price/cost figure is a plain number underneath, no conversion. "
-            "Just decides which symbol prefixes Price/kg, Scrap price, and the report's Financials section."
-        )
-        pricing_form.addRow("Currency", self.currency)
-
-        self.scrap_price_label = QtWidgets.QLabel()
-        self.scrap_price_per_kg = QtWidgets.QDoubleSpinBox()
-        self.scrap_price_per_kg.setRange(0.0, 100000.0)
-        self.scrap_price_per_kg.setDecimals(2)
-        self.scrap_price_per_kg.setValue(0.0)
-        self.scrap_price_per_kg.setToolTip(
-            "What you're paid per kg for scrapping cut-sheet offcuts too small to keep as a remnant "
-            "(0 = not tracked/not sold). One blended rate for the whole job -- stock's own Price/kg and "
-            "Density (set per entry in the Stock tab) are what make weight/cost figures possible at all; "
-            "an entry missing either is simply left out of the report's financial totals. Used only for "
-            "the report's estimate, never for choosing stock or ranking layouts."
-        )
-        pricing_form.addRow(self.scrap_price_label, self.scrap_price_per_kg)
-        inv_box_layout.addLayout(pricing_form)
-
-        def _update_scrap_price_label(code):
-            self.scrap_price_label.setText(f"Scrap price ({CURRENCY_SYMBOLS.get(code, '')}/kg)")
-        self.currency.currentTextChanged.connect(_update_scrap_price_label)
-        _update_scrap_price_label(self.currency.currentText())
 
         self.joint_stock_optimization = QtWidgets.QCheckBox("Joint stock optimization")
         self.joint_stock_optimization.setToolTip(
@@ -1626,8 +1606,7 @@ class NestingPanel(QtWidgets.QWidget):
                 "margin_top": self.margin_top.value(), "margin_bottom": self.margin_bottom.value(),
                 "margin_apply_all": self.margin_apply_all.isChecked(),
                 "prefer_remnants": self.prefer_remnants.isChecked(),
-                "currency": self.currency.currentText(),
-                "scrap_price_per_kg": self.scrap_price_per_kg.value(),
+                "currency": self.currency_code,
                 "joint_stock_optimization": self.joint_stock_optimization.isChecked(),
                 "true_joint_stock_optimization": self.true_joint_stock_optimization.isChecked(),
                 "ga_population": self.ga_population.value(), "ga_generations": self.ga_generations.value(),
@@ -1683,8 +1662,7 @@ class NestingPanel(QtWidgets.QWidget):
         self.margin_top.setValue(settings.get("margin_top", self.margin_top.value()))
         self.margin_bottom.setValue(settings.get("margin_bottom", self.margin_bottom.value()))
         self.prefer_remnants.setChecked(settings.get("prefer_remnants", True))
-        self.currency.setCurrentText(settings.get("currency", DEFAULT_CURRENCY))
-        self.scrap_price_per_kg.setValue(settings.get("scrap_price_per_kg", 0.0))
+        self.set_currency(settings.get("currency", DEFAULT_CURRENCY))
         self.joint_stock_optimization.setChecked(settings.get("joint_stock_optimization", False))
         self.true_joint_stock_optimization.setChecked(settings.get("true_joint_stock_optimization", False))
         self.ga_population.setValue(settings.get("ga_population", self.ga_population.value()))
@@ -2272,6 +2250,15 @@ class NestingPanel(QtWidgets.QWidget):
     def _common_line_cfg(self):
         return {} if self.common_line_enabled.isChecked() else None
 
+    def set_currency(self, code):
+        """Called by the native app's Stock tab currency picker (see
+        StockPanel), and by _load_job() restoring a saved job -- display
+        only, see self.currency_code's own comment. Emits currency_changed
+        regardless of the source, so a Stock tab picker stays in sync even
+        when a job load is what actually changed it."""
+        self.currency_code = code
+        self.currency_changed.emit(code)
+
     def _show_sheet(self):
         self.part_selector.blockSignals(True)
         self.part_selector.clear()
@@ -2543,7 +2530,6 @@ class NestingPanel(QtWidgets.QWidget):
         is None rather than a misleading 0."""
         capture_enabled = self.remnant_capture_enabled.isChecked()
         min_dim = self.remnant_min_dimension.value()
-        scrap_price = self.scrap_price_per_kg.value()
 
         new_sheets = new_weight = new_cost = 0.0
         remnant_sheets = remnant_weight = remnant_savings = 0.0
@@ -2586,8 +2572,10 @@ class NestingPanel(QtWidgets.QWidget):
                         captured_weight = rect_w * rect_h * stock.thickness * stock.density_g_cm3 / 1e6
             true_scrap = max(0.0, waste_weight - captured_weight)
             scrap_weight += true_scrap
-            if scrap_price > 0:
-                scrap_value += true_scrap * scrap_price
+            # Per-entry, not a global rate -- scrap value genuinely varies
+            # a lot by material (see StockSheet.scrap_price_per_kg).
+            if stock.scrap_price_per_kg is not None:
+                scrap_value += true_scrap * stock.scrap_price_per_kg
                 any_scrap_priced = True
 
         net_cost = None
@@ -2611,7 +2599,7 @@ class NestingPanel(QtWidgets.QWidget):
         preview per sheet plus a stock-consumption section."""
         microjoint_cfg = self._microjoint_cfg()
         common_line_cfg = self._common_line_cfg()
-        currency_symbol = CURRENCY_SYMBOLS.get(self.currency.currentText(), "")
+        currency_symbol = CURRENCY_SYMBOLS.get(self.currency_code, "")
         rows = []
         for i, sheet in enumerate(self.sheets):
             w, h = self.sheet_dims[i]
@@ -2660,8 +2648,8 @@ class NestingPanel(QtWidgets.QWidget):
         cost_text = money(fin["net_cost"])
         financials_section = f"""
 <h2>Financials</h2>
-<p>Estimate only, from each stock entry's own Price/kg and Density (Stock tab) plus the Scrap
-price setting -- an entry missing either is left out of these totals rather than guessed at.
+<p>Estimate only, from each stock entry's own Price/kg, Density, and Scrap price/kg (Stock tab) --
+an entry missing any of these is left out of the corresponding total rather than guessed at.
 A remnant's cost isn't cash spent this job (it was already on hand); it's shown separately as money
 saved by not buying that weight of material new.</p>
 <ul>

@@ -63,10 +63,10 @@ def test_joint_stock_optimization_ranks_by_weight_derived_cost():
     assert used_ids == {"cheap"}
 
 
-def test_captured_remnant_inherits_parent_price_and_density():
+def test_captured_remnant_inherits_parent_price_density_and_scrap_price():
     parent = inventory.StockSheet(material="steel", thickness=2.0, width=1220, height=2440,
                                    quantity=1, is_remnant=False, id="parent",
-                                   price_per_kg=2.0, density_g_cm3=7.85)
+                                   price_per_kg=2.0, density_g_cm3=7.85, scrap_price_per_kg=0.5)
     part = Part("Plate", [(0, 0), (100, 0), (100, 100), (0, 100)], quantity=1,
                 material="steel", thickness=2.0)
 
@@ -82,8 +82,22 @@ def test_captured_remnant_inherits_parent_price_and_density():
         assert len(captured) == 1
         assert captured[0].price_per_kg == 2.0
         assert captured[0].density_g_cm3 == 7.85
+        assert captured[0].scrap_price_per_kg == 0.5
     finally:
         os.unlink(path)
         log_path = path + ".log.jsonl"
         if os.path.exists(log_path):
             os.unlink(log_path)
+
+
+def test_scrap_price_per_kg_is_a_plain_per_entry_field():
+    """No global/blended rate anywhere in inventory.py -- two entries of
+    different materials can carry genuinely different scrap rates."""
+    steel = inventory.StockSheet(material="steel", thickness=2.0, width=100, height=100,
+                                  scrap_price_per_kg=0.35)
+    aluminum = inventory.StockSheet(material="aluminum", thickness=2.0, width=100, height=100,
+                                     scrap_price_per_kg=1.40)
+    unpriced = inventory.StockSheet(material="brass", thickness=2.0, width=100, height=100)
+    assert steel.scrap_price_per_kg == 0.35
+    assert aluminum.scrap_price_per_kg == 1.40
+    assert unpriced.scrap_price_per_kg is None

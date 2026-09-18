@@ -9,8 +9,17 @@ It is also the home of the inventory FILE operations now: Load, and Clear
 table below (Save writes back to the loaded JSON file). The ribbon no
 longer carries any of these.
 
+Also the home of the report's Currency picker and each stock entry's own
+Scrap price/kg column -- both used only by `NestingPanel._job_financials()`/
+`_build_report_html()` (shared code, so it stays reachable from there even
+though the WIDGETS live here) -- Price/kg and Scrap price genuinely vary a
+lot by material, so neither is a single blended setting; see
+`StockSheet.scrap_price_per_kg` and `NestingPanel.currency_code`.
+
 Refreshes automatically whenever the Nesting tab loads/clears inventory,
-via `NestingPanel.inventory_changed`.
+via `NestingPanel.inventory_changed`; the currency picker stays in sync
+with `NestingPanel.currency_code` (e.g. after a job load restores a
+different one) via `NestingPanel.currency_changed`.
 """
 
 import os
@@ -18,6 +27,7 @@ import os
 from PySide6 import QtCore, QtWidgets
 
 import inventory
+from nesting_widgets import CURRENCY_SYMBOLS, DEFAULT_CURRENCY
 
 
 # Password that must be entered to confirm "Clear" -- a deliberate
@@ -32,10 +42,12 @@ def check_clear_password(password):
 
 
 COLUMNS = ["ID", "Material", "Thickness (mm)", "Width (mm)", "Height (mm)", "Quantity (blank=unlimited)",
-           "Remnant", "Price/kg (blank=unpriced)", "Density g/cm³ (blank=unpriced)"]
-_REMNANT_COL = len(COLUMNS) - 3
-_PRICE_COL = len(COLUMNS) - 2
-_DENSITY_COL = len(COLUMNS) - 1
+           "Remnant", "Price/kg (blank=unpriced)", "Density g/cm³ (blank=unpriced)",
+           "Scrap price/kg (blank=unpriced)"]
+_REMNANT_COL = len(COLUMNS) - 4
+_PRICE_COL = len(COLUMNS) - 3
+_DENSITY_COL = len(COLUMNS) - 2
+_SCRAP_PRICE_COL = len(COLUMNS) - 1
 
 
 class StockPanel(QtWidgets.QWidget):
@@ -57,6 +69,17 @@ class StockPanel(QtWidgets.QWidget):
         for b in (load_btn, clear_btn):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
+        btn_row.addWidget(QtWidgets.QLabel("Currency:"))
+        self.currency = QtWidgets.QComboBox()
+        self.currency.addItems(list(CURRENCY_SYMBOLS.keys()))
+        self.currency.setCurrentText(self.panel.currency_code)
+        self.currency.setToolTip(
+            "Display only -- every price/cost figure on this tab and in the report is a plain number "
+            "underneath, no conversion. Just decides which symbol prefixes them."
+        )
+        self.currency.currentTextChanged.connect(self.panel.set_currency)
+        self.panel.currency_changed.connect(self._sync_currency_display)
+        btn_row.addWidget(self.currency)
         layout.addLayout(btn_row)
 
         self.table = QtWidgets.QTableWidget(0, len(COLUMNS))
@@ -129,6 +152,16 @@ class StockPanel(QtWidgets.QWidget):
 
     # ------------------------------------------------------------- display
 
+    def _sync_currency_display(self, code):
+        """Keeps the combobox in sync when currency_code changed from
+        somewhere OTHER than this combobox (e.g. a job load) -- signals
+        blocked so that sync doesn't itself re-fire set_currency()."""
+        if self.currency.currentText() == code:
+            return
+        self.currency.blockSignals(True)
+        self.currency.setCurrentText(code)
+        self.currency.blockSignals(False)
+
     def refresh(self):
         stock = self.panel._inventory_template or []
         self.table.setRowCount(0)
@@ -155,6 +188,8 @@ class StockPanel(QtWidgets.QWidget):
         self.table.setItem(row, _PRICE_COL, QtWidgets.QTableWidgetItem(price_text))
         density_text = "" if s.density_g_cm3 is None else str(s.density_g_cm3)
         self.table.setItem(row, _DENSITY_COL, QtWidgets.QTableWidgetItem(density_text))
+        scrap_price_text = "" if s.scrap_price_per_kg is None else str(s.scrap_price_per_kg)
+        self.table.setItem(row, _SCRAP_PRICE_COL, QtWidgets.QTableWidgetItem(scrap_price_text))
 
     # --------------------------------------------------------------- edits
 
@@ -178,6 +213,7 @@ class StockPanel(QtWidgets.QWidget):
             qty_text = text(row, 5)
             price_text = text(row, _PRICE_COL)
             density_text = text(row, _DENSITY_COL)
+            scrap_price_text = text(row, _SCRAP_PRICE_COL)
             remnant_item = self.table.item(row, _REMNANT_COL)
             stock.append(inventory.StockSheet(
                 id=text(row, 0) or None,
@@ -189,6 +225,7 @@ class StockPanel(QtWidgets.QWidget):
                 is_remnant=bool(remnant_item and remnant_item.checkState() == QtCore.Qt.Checked),
                 price_per_kg=None if price_text == "" else float(price_text),
                 density_g_cm3=None if density_text == "" else float(density_text),
+                scrap_price_per_kg=None if scrap_price_text == "" else float(scrap_price_text),
             ))
         return stock
 

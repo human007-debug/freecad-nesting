@@ -9,7 +9,8 @@
       "is_remnant": true,
       "id": "R-001",
       "price_per_kg": null,
-      "density_g_cm3": 7.85
+      "density_g_cm3": 7.85,
+      "scrap_price_per_kg": null
     },
     {
       "material": "Mild Steel",
@@ -20,7 +21,8 @@
       "is_remnant": false,
       "id": null,
       "price_per_kg": null,
-      "density_g_cm3": 7.85
+      "density_g_cm3": 7.85,
+      "scrap_price_per_kg": null
     },
     {
       "material": "Stainless 304",
@@ -31,7 +33,8 @@
       "is_remnant": false,
       "id": null,
       "price_per_kg": null,
-      "density_g_cm3": 8.0
+      "density_g_cm3": 8.0,
+      "scrap_price_per_kg": null
     }
   ]
 }

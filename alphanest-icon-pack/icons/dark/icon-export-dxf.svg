@@ -1,0 +1,9 @@
+<svg width="96" height="96" viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg">
+  <rect width="96" height="96" rx="18" fill="#14161A"/>
+  <path d="M28 20 H54 L64 30 V76 H28 Z" fill="none" stroke="#EDEFF2" stroke-width="3.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M54 20 V30 H64" fill="none" stroke="#EDEFF2" stroke-width="3.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <line x1="34" y1="44" x2="58" y2="44" stroke="#3A4048" stroke-width="2.4"/>
+  <line x1="34" y1="52" x2="52" y2="52" stroke="#3A4048" stroke-width="2.4"/>
+  <text x="46" y="66" font-family="'Space Grotesk','Helvetica Neue',Arial,sans-serif" font-size="10" font-weight="700" letter-spacing="1" fill="#E8352E" text-anchor="middle">DXF</text>
+  <path d="M70 30 L82 30 M82 30 L76 24 M82 30 L76 36" fill="none" stroke="#E8352E" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

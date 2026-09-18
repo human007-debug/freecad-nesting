@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+
+# geometry_fast is an optional, locally-built accelerator (see README's
+# "Performance" section / setup_geometry_fast.py) -- both are Cython/gcc
+# build output, regenerable from geometry_fast.pyx, and the .so is tied to
+# the exact machine/Python ABI that built it.
+geometry_fast.c
+geometry_fast*.so

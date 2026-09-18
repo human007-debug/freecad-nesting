@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>FreeCAD Nest — Nesting Workbench (Mockup)</title>
+<style>
+  :root{
+    --titlebar:#1c2733;
+    --ribbon-bg:#eef0f2;
+    --ribbon-border:#d2d6db;
+    --tab-active:#ffffff;
+    --tab-inactive:#dde1e5;
+    --accent:#2f6fb3;
+    --accent-dark:#1f4d80;
+    --tree-bg:#fafbfc;
+    --tree-border:#e1e4e8;
+    --sheet-bg:#3d6690;
+    --sheet-bg2:#4a76a0;
+    --part-fill:#355d85;
+    --part-stroke:#e8823c;
+    --part-stroke2:#ff4fa0;
+    --panel-row-a:#e7f4e4;
+    --panel-row-b:#dcefe8;
+    --status-bg:#1c2733;
+    --text:#26313d;
+    --text-dim:#5c6b78;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;font-family:"Segoe UI",Tahoma,Arial,sans-serif;color:var(--text);background:#c9ced3;font-size:12px;}
+  .app{display:flex;flex-direction:column;height:100vh;border:1px solid #0e161f;}
+
+  /* ---- title bar ---- */
+  .titlebar{
+    background:var(--titlebar);color:#dfe6ec;height:26px;
+    display:flex;align-items:center;justify-content:center;
+    font-size:12px;letter-spacing:.3px;flex-shrink:0;position:relative;
+  }
+  .titlebar .brand{position:absolute;left:8px;display:flex;align-items:center;gap:6px;}
+  .titlebar .brand .logo{
+    width:16px;height:16px;border-radius:3px;
+    background:conic-gradient(from 180deg,var(--accent),#7fb2e0,var(--accent));
+  }
+  .titlebar .win-dots{position:absolute;right:8px;display:flex;gap:6px;opacity:.6;font-size:11px;}
+
+  /* ---- tab bar ---- */
+  .tabbar{
+    background:var(--tab-inactive);display:flex;align-items:flex-end;
+    padding:4px 6px 0 6px;gap:2px;flex-shrink:0;border-bottom:1px solid var(--ribbon-border);
+  }
+  .tabbar .tab{
+    padding:5px 14px;font-size:12px;color:var(--text-dim);
+    border-radius:3px 3px 0 0;cursor:default;
+  }
+  .tabbar .tab.active{background:var(--tab-active);color:var(--text);font-weight:600;border:1px solid var(--ribbon-border);border-bottom:1px solid var(--tab-active);margin-bottom:-1px;}
+
+  /* ---- ribbon ---- */
+  .ribbon{
+    background:var(--ribbon-bg);border-bottom:1px solid var(--ribbon-border);
+    display:flex;align-items:stretch;padding:6px 8px;gap:0;flex-shrink:0;overflow-x:auto;
+  }
+  .rgroup{display:flex;flex-direction:column;align-items:center;padding:2px 12px;border-right:1px solid var(--ribbon-border);}
+  .rgroup:last-child{border-right:none;}
+  .rgroup .btns{display:flex;gap:10px;align-items:flex-start;flex:1;}
+  .rbtn{display:flex;flex-direction:column;align-items:center;gap:3px;width:52px;cursor:default;}
+  .rbtn .ic{
+    width:22px;height:22px;border-radius:4px;
+    background:linear-gradient(180deg,#5c93c9,var(--accent-dark));
+    display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;font-weight:700;
+  }
+  .rbtn.small{flex-direction:row;width:auto;gap:5px;}
+  .rbtn.small .ic{width:14px;height:14px;border-radius:3px;font-size:8px;}
+  .rbtn span{font-size:10px;color:var(--text-dim);text-align:center;line-height:1.15;}
+  .rgroup .label{font-size:10px;color:var(--text-dim);margin-top:4px;border-top:1px solid var(--ribbon-border);width:100%;text-align:center;padding-top:3px;}
+  .rgroup .stack{display:flex;flex-direction:column;gap:4px;}
+
+  /* ---- main body ---- */
+  .body{flex:1;display:flex;min-height:0;}
+
+  /* left column: tree + properties */
+  .leftcol{width:210px;flex-shrink:0;display:flex;flex-direction:column;border-right:1px solid var(--tree-border);background:var(--tree-bg);}
+  .leftcol .subtabs{display:flex;border-bottom:1px solid var(--tree-border);}
+  .leftcol .subtabs div{padding:4px 10px;font-size:11px;color:var(--text-dim);}
+  .leftcol .subtabs div.active{background:#fff;color:var(--text);border-right:1px solid var(--tree-border);border-left:1px solid var(--tree-border);font-weight:600;}
+  .tree{flex:1;overflow-y:auto;padding:4px 0;}
+  .tree .node{display:flex;align-items:center;gap:5px;padding:3px 8px;white-space:nowrap;}
+  .tree .node .caret{width:8px;color:var(--text-dim);font-size:9px;}
+  .tree .node .icn{width:10px;height:10px;background:var(--accent);border-radius:2px;flex-shrink:0;}
+  .tree .node.folder .icn{background:#e8b23c;border-radius:1px;}
+  .tree .node.selected{background:#cfe4f7;}
+  .tree .node span{font-size:11.5px;}
+
+  .props{border-top:1px solid var(--tree-border);}
+  .props table{width:100%;border-collapse:collapse;font-size:11px;}
+  .props td{padding:3px 8px;border-bottom:1px solid #eef0f2;}
+  .props td:first-child{color:var(--text-dim);width:56%;}
+  .props td:last-child{font-weight:600;color:var(--text);}
+
+  /* center canvas */
+  .canvasWrap{flex:1;background:#c9ced3;display:flex;align-items:center;justify-content:center;padding:14px;min-width:0;}
+  .sheet{
+    background:linear-gradient(135deg,var(--sheet-bg),var(--sheet-bg2));
+    border:2px solid #223a52;width:100%;height:100%;max-width:920px;
+    position:relative;box-shadow:inset 0 0 40px rgba(0,0,0,.25);
+  }
+  .crosshair{position:absolute;top:10px;left:10px;color:#dfe9f2;font-size:18px;opacity:.5;}
+
+  /* right column: part list */
+  .rightcol{width:150px;flex-shrink:0;border-left:1px solid var(--tree-border);background:#fff;display:flex;flex-direction:column;}
+  .rightcol .hdr{padding:6px 8px;font-size:10.5px;color:var(--text-dim);border-bottom:1px solid var(--tree-border);}
+  .rightcol .hdr div{display:flex;justify-content:space-between;}
+  .partcards{flex:1;overflow-y:auto;}
+  .pcard{display:flex;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid #eef0f2;}
+  .pcard.a{background:var(--panel-row-a);}
+  .pcard.b{background:var(--panel-row-b);}
+  .pcard .thumb{width:34px;height:26px;border-radius:2px;background:#2b4a68;flex-shrink:0;display:flex;align-items:center;justify-content:center;}
+  .pcard .thumb svg{width:26px;height:20px;}
+  .pcard .meta{font-size:11px;line-height:1.3;}
+  .pcard .meta .qty{color:var(--text-dim);}
+
+  /* status bar */
+  .statusbar{
+    height:22px;background:var(--status-bg);color:#c7d1db;
+    display:flex;align-items:center;justify-content:space-between;
+    font-size:10.5px;padding:0 10px;flex-shrink:0;
+  }
+  .statusbar .segs{display:flex;gap:16px;}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="titlebar">
+    <div class="brand"><div class="logo"></div>FreeCAD Nest 0.1 — [Job_T270]</div>
+    FreeCAD Nest — Nesting Workbench (mockup)
+    <div class="win-dots">— &nbsp; ▢ &nbsp; ✕</div>
+  </div>
+
+  <div class="tabbar">
+    <div class="tab">Files</div>
+    <div class="tab">Work-space</div>
+    <div class="tab">CAD</div>
+    <div class="tab active">Nesting</div>
+    <div class="tab">Nesting Detail</div>
+    <div class="tab">Parts</div>
+    <div class="tab">Part Detail</div>
+    <div class="tab">Tools</div>
+    <div class="tab">Help</div>
+  </div>
+
+  <div class="ribbon">
+    <div class="rgroup">
+      <div class="btns">
+        <div class="rbtn"><div class="ic">▶</div><span>Auto<br>Nest</span></div>
+        <div class="rbtn"><div class="ic">✎</div><span>Manual<br>Nest</span></div>
+        <div class="rbtn"><div class="ic">✕</div><span>Clear<br>Nest</span></div>
+      </div>
+      <div class="label">Nesting</div>
+    </div>
+    <div class="rgroup">
+      <div class="stack">
+        <div class="rbtn small"><div class="ic">·</div><span>Auto Pierce Points</span></div>
+        <div class="rbtn small"><div class="ic">↦</div><span>Common Cut</span></div>
+        <div class="rbtn small"><div class="ic">⧉</div><span>Part Nest Order</span></div>
+      </div>
+      <div class="label">Motion Optimization</div>
+    </div>
+    <div class="rgroup">
+      <div class="stack">
+        <div class="rbtn small"><div class="ic">↗</div><span>Lead-in / Lead-out</span></div>
+        <div class="rbtn small"><div class="ic">▦</div><span>Add / Remove Height Sense</span></div>
+        <div class="rbtn small"><div class="ic">⟟</div><span>Add / Remove Manual NC</span></div>
+      </div>
+      <div class="label">Edit NC</div>
+    </div>
+    <div class="rgroup">
+      <div class="btns">
+        <div class="rbtn"><div class="ic">▤</div><span>Remnant<br>Sheet</span></div>
+        <div class="rbtn"><div class="ic">◧</div><span>Crop<br>Sheet</span></div>
+        <div class="rbtn"><div class="ic">▨</div><span>Cut<br>Scrap</span></div>
+      </div>
+      <div class="label">Remnant</div>
+    </div>
+    <div class="rgroup">
+      <div class="btns">
+        <div class="rbtn"><div class="ic">✓</div><span>Verify<br>Nest</span></div>
+      </div>
+      <div class="label">Verify</div>
+    </div>
+  </div>
+
+  <div class="body">
+
+    <div class="leftcol">
+      <div class="subtabs"><div class="active">Nesting NC</div><div>&nbsp;</div></div>
+      <div class="tree">
+        <div class="node"><span class="caret">▸</span><div class="icn"></div><span>SN4</span></div>
+        <div class="node"><span class="caret">▸</span><div class="icn"></div><span>SN5</span></div>
+        <div class="node"><span class="caret">▸</span><div class="icn"></div><span>SN6</span></div>
+        <div class="node"><span class="caret">▸</span><div class="icn"></div><span>SN7</span></div>
+        <div class="node"><span class="caret">▸</span><div class="icn"></div><span>SN8</span></div>
+        <div class="node"><span class="caret">▸</span><div class="icn"></div><span>SN9</span></div>
+        <div class="node"><span class="caret">▸</span><div class="icn"></div><span>SN10</span></div>
+        <div class="node"><span class="caret">▸</span><div class="icn"></div><span>SN11</span></div>
+        <div class="node"><span class="caret">▸</span><div class="icn"></div><span>SN12</span></div>
+        <div class="node folder selected"><span class="caret">▾</span><div class="icn"></div><span>T270</span></div>
+      </div>
+      <div class="props">
+        <table>
+          <tr><td>Sheet Name</td><td>Sheet 3321</td></tr>
+          <tr><td>Material</td><td>MS</td></tr>
+          <tr><td>Thickness</td><td>0.5</td></tr>
+          <tr><td>Length</td><td>120</td></tr>
+          <tr><td>Width</td><td>48</td></tr>
+          <tr><td>No. of Repeats</td><td>1</td></tr>
+          <tr><td>Stack Quantity</td><td>1</td></tr>
+          <tr><td>Scrap %</td><td>41.8</td></tr>
+          <tr><td>Plate Used</td><td>100</td></tr>
+          <tr><td>Length Used</td><td>91.2</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="canvasWrap">
+      <div class="sheet" id="sheet">
+        <div class="crosshair">＋</div>
+        <!-- nested parts, generated below -->
+      </div>
+    </div>
+
+    <div class="rightcol">
+      <div class="hdr"><div><span>Part Name</span></div><div><span>Quantity</span></div><div><span>Work Order No.</span></div></div>
+      <div class="partcards" id="partcards"></div>
+    </div>
+
+  </div>
+
+  <div class="statusbar">
+    <div class="segs"><span>x=41.2 y=38.9</span><span>Select Nesting NC menu option</span></div>
+    <div class="segs"><span>admin JobShop</span><span>FreeCAD_3DLink_2026</span><span>Sheet 3321 [1 of 10]</span></div>
+  </div>
+
+</div>
+
+<script>
+// Generate a plausible nested-parts field on the sheet, and matching thumbnail cards,
+// purely for visual mockup purposes (not a real nesting result).
+const sheet = document.getElementById('sheet');
+const W = 900, H = 560;
+const partShapes = [
+  // [points as fractions of W/H, hue]
+  {pts:[[.03,.05],[.14,.02],[.17,.20],[.05,.24]], color:'#355d85'},
+  {pts:[[.18,.04],[.30,.03],[.33,.30],[.24,.34],[.16,.20]], color:'#2f5a80'},
+  {pts:[[.35,.03],[.47,.06],[.44,.32],[.34,.30]], color:'#3a6288'},
+  {pts:[[.50,.04],[.64,.03],[.66,.18],[.55,.26],[.48,.16]], color:'#345d84'},
+  {pts:[[.68,.03],[.80,.05],[.78,.22],[.66,.20]], color:'#2f5a80'},
+  {pts:[[.82,.04],[.96,.06],[.94,.28],[.83,.26]], color:'#3a6288'},
+  {pts:[[.04,.30],[.16,.28],[.19,.46],[.06,.50]], color:'#2f5a80'},
+  {pts:[[.20,.36],[.32,.34],[.30,.55],[.19,.54]], color:'#355d85'},
+  {pts:[[.36,.34],[.46,.36],[.43,.58],[.34,.56]], color:'#3a6288'},
+  {pts:[[.49,.30],[.62,.32],[.60,.52],[.48,.54]], color:'#2f5a80'},
+  {pts:[[.64,.28],[.78,.30],[.80,.50],[.66,.52]], color:'#355d85'},
+  {pts:[[.82,.32],[.95,.34],[.93,.56],[.83,.54]], color:'#3a6288'},
+  {pts:[[.04,.55],[.18,.53],[.20,.72],[.07,.76]], color:'#2f5a80'},
+  {pts:[[.22,.58],[.34,.60],[.31,.80],[.20,.78]], color:'#355d85'},
+  {pts:[[.37,.60],[.50,.58],[.48,.82],[.36,.84]], color:'#3a6288'},
+  {pts:[[.53,.60],[.66,.58],[.68,.80],[.54,.84]], color:'#2f5a80'},
+  {pts:[[.70,.56],[.84,.58],[.82,.78],[.69,.80]], color:'#355d85'},
+  {pts:[[.86,.58],[.97,.60],[.95,.82],[.85,.80]], color:'#3a6288'},
+  {pts:[[.05,.80],[.22,.82],[.20,.97],[.06,.96]], color:'#2f5a80'},
+  {pts:[[.25,.84],[.40,.82],[.42,.98],[.26,.98]], color:'#355d85'},
+  {pts:[[.44,.84],[.58,.86],[.56,.98],[.43,.98]], color:'#3a6288'},
+  {pts:[[.60,.84],[.75,.82],[.77,.98],[.61,.98]], color:'#2f5a80'},
+  {pts:[[.78,.84],[.93,.86],[.91,.98],[.79,.98]], color:'#355d85'},
+];
+
+function toSvgPoly(pts,w,h){ return pts.map(p=>`${(p[0]*w).toFixed(1)},${(p[1]*h).toFixed(1)}`).join(' '); }
+
+let svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" height="100%" style="position:absolute;inset:0;">`;
+partShapes.forEach((p,i)=>{
+  const pts = toSvgPoly(p.pts, W, H);
+  svg += `<polygon points="${pts}" fill="${p.color}" stroke="#e8823c" stroke-width="2" />`;
+  svg += `<polygon points="${pts}" fill="none" stroke="#ff4fa0" stroke-width="1" stroke-dasharray="3,3" transform="scale(0.94)" transform-origin="center" />`;
+  // pierce point dot at first vertex
+  const [x0,y0] = p.pts[0];
+  svg += `<circle cx="${(x0*W+6).toFixed(1)}" cy="${(y0*H+6).toFixed(1)}" r="2.4" fill="#ff4fa0" />`;
+});
+svg += `</svg>`;
+sheet.insertAdjacentHTML('beforeend', svg);
+
+// right-hand part cards
+const names = ['SN5','SN6','SN7','SN9','SN10','SN12','SN4','SN8','SN11','SN13'];
+const qtys  = ['6 of 6','8 of 8','8 of 8','8 of 8','8 of 8','8 of 8','8 of 8','8 of 8','8 of 8','4 of 4'];
+const cardShapes = [
+  'M2,18 L10,2 L18,10 L14,18 Z',
+  'M2,4 H20 V16 H2 Z',
+  'M2,12 L10,2 L20,4 L18,18 L4,18 Z',
+  'M2,18 L6,2 L14,2 L18,18 Z',
+  'M2,2 L20,2 L14,18 L2,14 Z',
+  'M2,10 L10,2 L18,10 L10,18 Z',
+];
+const wrap = document.getElementById('partcards');
+names.forEach((n,i)=>{
+  const cls = i%2===0?'a':'b';
+  const shape = cardShapes[i%cardShapes.length];
+  wrap.insertAdjacentHTML('beforeend', `
+    <div class="pcard ${cls}">
+      <div class="thumb"><svg viewBox="0 0 22 20"><path d="${shape}" fill="#7fb2e0" stroke="#e8823c" stroke-width="1.2"/></svg></div>
+      <div class="meta"><div>${n}</div><div class="qty">${qtys[i]}</div></div>
+    </div>`);
+});
+</script>
+</body>
+</html>

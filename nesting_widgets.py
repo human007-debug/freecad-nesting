@@ -2684,7 +2684,12 @@ saved by not buying that weight of material new.</p>
                 used_counts[key] = used_counts.get(key, 0) + 1
             template = self._inventory_template or []
             stock_rows = []
-            for (sid, mat, thk, w, h), used in sorted(used_counts.items()):
+            # A full sheet's id is routinely None (only remnants get an
+            # auto-generated id) -- sorting tuples with a bare None
+            # alongside a str id raises TypeError in Python 3, so sort on
+            # "" in None's place; the actual (possibly-None) sid is still
+            # what gets displayed/matched below, unchanged.
+            for (sid, mat, thk, w, h), used in sorted(used_counts.items(), key=lambda kv: (kv[0][0] or "", kv[0][1:])):
                 match = next(
                     (t for t in template
                      if (t.id, t.material, t.thickness, t.width, t.height) == (sid, mat, thk, w, h)),

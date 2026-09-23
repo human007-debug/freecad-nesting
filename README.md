@@ -2,11 +2,13 @@
 
 A Python implementation of true polygon (not bounding-box) 2D sheet
 nesting, of the kind SigmaNest/DeepNest do, placing parts via real
-no-fit-polygon (NFP) geometry. Two dependencies: `pip install pyclipper`
+no-fit-polygon (NFP) geometry. Three dependencies: `pip install pyclipper`
 (exact Minkowski-sum/polygon-boolean math — see "How the algorithm
-works") and `pip install ezdxf` (DXF import — see "DXF/DWG import").
-Everything else (DXF *export*, FreeCAD integration, inventory) is still
-plain Python, no other third-party libraries.
+works"), `pip install ezdxf` (DXF import — see "DXF/DWG import") and
+`pip install openpyxl` (the stock inventory's `.xlsx` file — see
+"Multi-material assemblies & stock inventory"). Everything else (DXF
+*export*, FreeCAD integration, the nesting engine itself) is still plain
+Python, no other third-party libraries.
 
 ## Status (updated after step 1 & 2)
 
@@ -70,7 +72,7 @@ python3) groups parts by `(material, thickness)` — never mixing them onto
 the same sheet — matches each group to its best-fit stock sheet from an
 inventory list (remnants before full sheets), and cascades to the
 next-best stock as each one is exhausted. Wired into the workbench UI as
-an optional "Load Inventory JSON..." step. See "Multi-material assemblies
+an optional "Load Inventory..." step. See "Multi-material assemblies
 & stock inventory" below.
 
 **Step 6 — genetic algorithm over part ordering: done.** `genetic.py`
@@ -177,7 +179,8 @@ working) but stay hidden in favor of the ribbon — the FreeCAD workbench is
 unaffected, since it keeps the default. A new **Stock tab**
 (`native_app/stock_panel.py`) lets you view and edit the loaded inventory
 directly — add/delete rows, edit material/thickness/size/quantity/remnant,
-save back to the JSON, create a fresh empty inventory file — instead of
+save back to the file (a `.xlsx` workbook since Step 23; JSON at the time)
+— instead of
 hand-editing it; it refreshes automatically via a new `inventory_changed`
 signal on `NestingPanel`, fired after Load/Clear/Commit.
 
@@ -890,6 +893,209 @@ Two independent additions.
   for $10 less on one fewer sheet; a second scenario where the greedy
   result is already optimal confirmed the solver never regresses it.
 
+**Step 23 — the stock list as an Excel workbook: done.** The inventory was
+a JSON file, and it shouldn't have been: it is a *table* — one row per
+stock entry, the same ten columns the Stock tab already showed — and the
+person who actually knows what's in the racks is a storeman, not a
+developer. Handed a `.json` they can't sort it, filter it, total a column,
+or send it to anyone; and one missed comma breaks the file for everyone.
+So `inventory.py` now reads and writes `.xlsx` (openpyxl): a `Stock`
+worksheet with a frozen, bold heading row, a filter row, and a Yes/No
+dropdown on Remnant.
+
+The sheet layout has exactly one definition — `_STOCK_FIELDS` in
+`inventory.py`, which `STOCK_COLUMNS` and, through it, `stock_panel.py`'s
+own table columns are both built from — so the sheet someone edits in Excel
+and the table they edit in the app cannot drift apart.
+
+The reader is deliberately forgiving, because the entire point of handing
+someone a spreadsheet is that they edit it: headings are matched ignoring
+case, spacing and the parenthesised units (`Thickness (mm)`, `thickness`
+and `THICKNESS` are one column), columns can be reordered, a shop's own
+extra columns (`Supplier`, `Bin`) are carried past rather than treated as
+errors, the table is found beneath a title row, blank spacer rows are
+skipped, Remnant takes `Yes`/`Y`/`TRUE`/blank, and a width typed `1,220`
+reads as 1220. A cell that genuinely isn't a number names its row and
+column in the error instead of failing anonymously. Blank still means
+"unlimited"/"unpriced" — never zero, which is a real and very different
+answer.
+
+Writing preserves every OTHER worksheet in the workbook: `commit_job()`
+rewrites the inventory file after every committed job, and it must not eat
+the supplier-notes tab someone keeps beside the stock.
+
+**Nothing old breaks.** Format is chosen by the path's extension, so a
+`.json` inventory still loads, and a job committed against one still writes
+`.json` back rather than silently becoming a workbook. `convert_inventory()`
+moves one over; `my_inventory.json` and `examples/inventory.json` were both
+converted (the originals kept). The Stock tab grew a **Save As...** button,
+which is the same conversion from the UI — and also gives a table built up
+with Add Row somewhere to live, where before that case hit a "no inventory
+file loaded" dead end. openpyxl is imported lazily, inside the `.xlsx`
+paths only, since this module is also imported inside FreeCAD's bundled
+Python where an install can't be assumed.
+
+The commit *audit log* stays `.log.jsonl`: it's an append-only machine
+record of what was cut, not a table anyone maintains by hand — the two
+files have genuinely different jobs.
+
+Verified by 24 new tests (`tests/test_inventory_excel.py`) covering the
+round trip of every field including the blanks, hand-made sheets with
+reordered/extra columns and a title row, each spelling of Remnant, the
+error message's row/column, other worksheets surviving a rewrite, format
+following the extension, and a full `commit_job()` against an `.xlsx` —
+plus a headless run of the real app: load `my_inventory.xlsx`, edit a cell
+in the Stock tab, Save, reload.
+
+**Step 24 — UI refresh: done.** The brief was "the UI looks outdated, make
+it more polished — Autodesk Fusion, and Apple in general". Four rules came
+out of that, and everything below follows from them:
+
+1. **Quiet chrome, loud content.** The window is neutral; the only
+   saturated color is the brand red, on the one primary action and on
+   things that genuinely need attention. Previously EVERY button in the
+   app turned brand red on hover, which made the whole window feel like an
+   alarm panel and left the real primary action saying nothing.
+2. **Hairlines, not boxes.** Structure comes from a separator and a change
+   of surface. The old sheet drew a 1px box around every group, table,
+   header cell and input — a grid of boxes reads as a 2005 Win32 form.
+3. **Room to breathe.** A real type ramp (12px captions / 13px body /
+   15–20px titles instead of one undifferentiated 11px), 8px-grid padding,
+   32px table rows, and every tab opening with its name and one line about
+   what it is for.
+4. **The sheet is material, not a colored rectangle.** It is painted as a
+   neutral plate with a 100 mm graph-paper grid and a soft drop shadow, so
+   the parts are the only colored things on it — it used to be filled
+   steel blue, which fought every part color on top of it and stayed
+   bright blue in dark mode.
+
+`native_app/theme.py` became the design system those rules live in: named
+palette tokens for both themes, one font stack, one set of radii, and the
+app-wide stylesheet generated from them (`string.Template`, so the CSS
+braces stay readable). Widgets that paint themselves read the same tokens
+rather than hardcoding hexes, and the sheet canvas is re-colored through a
+new `nesting_widgets.set_sheet_palette()` — a hook, not an import, because
+that module is shared with the FreeCAD workbench and can't depend on the
+native app. The workbench, which has no stylesheet of its own, gets
+`nesting_widgets.FALLBACK_QSS` (applied only when the host application has
+set no stylesheet, so it can never fight a host theme).
+
+Visible changes: a segmented tab strip (below) instead of raised 3D tabs;
+a toolbar whose
+buttons size themselves (the primary "Run Nesting" was being elided to
+"Run ...ting" by a hand-computed fixed width that didn't know about its own
+padding) with Settings parked at the right; tables with row hairlines,
+aligned numeric columns and headings that no longer truncate to "tity
+(blank=unlin" (see Step 23 for the Stock table's own columns); the Parts
+tab's gallery as tiles with the part sitting ON them rather than saturated
+blocks with the labels running over them, and its detail pane side by side
+with the render instead of stacked under a wide, short strip; a borderless
+in-row delete affordance (at 28px wide with the new padding, the old one
+clipped its own glyph to an empty box); restyled checkboxes, combo and
+spin controls (the tick, chevrons and arrows ship as SVGs in
+`native_app/assets/`, since Qt can't draw them on a restyled indicator);
+an empty-state line in the Layout Results panel; and a monospaced, sunken
+console log.
+
+Two Qt-specific bugs this turned up and fixed:
+
+* **Selected rows tinted their own icons blue.** Qt renders an item's
+  icon in `QIcon.Selected` mode on a selected row and, given only a Normal
+  pixmap, generates that variant by washing it in the Qt PALETTE's
+  highlight color — a stock blue, since this theme is pure QSS and never
+  touches the palette. A selected sheet thumbnail came back blue while the
+  same sheet in the preview beside it was grey. `untinted_icon()`
+  registers one pixmap for every mode, leaving Qt nothing to invent.
+* **Labels drew their own grey boxes.** `QWidget { background: ... }`
+  reaches `QLabel`/`QCheckBox` too (both paint a styled background), so
+  every caption inside a white settings card sat on its own rectangle of
+  window-grey. Fixed by making those widgets explicitly transparent.
+
+**The tab strip** (`native_app/segmented.py`) is modeled on the Apple
+reference the user supplied (`applereference.jpg` -- Apple Music's tab
+bar): one rounded track holding the tabs, with the selected one marked by
+a filled pill that floats inside it and takes the accent color, rather
+than by an underline or a raised box.
+
+It is a real widget, not a styled `QTabBar`, because that shape is made
+entirely of padding and margins and QTabBar honors neither from a
+stylesheet -- styling it produced a pill taller than the track it sat in,
+flush against the menu bar above. The `QTabWidget` keeps doing its own job
+(pages, current index, session persistence) with its bar hidden, and the
+strip drives it; sync runs both ways, so View > Nesting Tab, Ctrl+1/2/3,
+the Parts tab's "Ready to nest ->" button and a restored session all move
+the pill. Its three glyphs (an L-bracket, two stacked sheets, parts on a
+sheet) are drawn in `QPainter` and re-stroked on selection and on a theme
+change -- the icon pack's own icons are rounded tiles built for toolbar
+buttons, and a tile inside a pill reads as a button within a button.
+
+Verified by rendering the real window headlessly (`QT_QPA_PLATFORM=offscreen`,
+`QWidget.grab()`) for all three tabs, the settings dialog, and a completed
+two-sheet run, in both themes, and iterating on the images; plus the full
+test suite after each round -- now 117 tests, the five new ones
+(`tests/test_segmented_tabs.py`) pinning the strip and the pages to the
+same answer whichever side moved.
+
+**Step 25 — Apple accent, new mark, editable ribbon: done.** Five follow-ups
+to Step 24, all from the same round of feedback on the running app.
+
+**The accent is Apple's own.** `#FC4269`, sampled straight out of the tab
+bar in `applereference.jpg` rather than eyeballed, lifted to `#FF5C7E` in
+dark mode the way Apple lifts its system colors there. It replaces the icon
+pack's `#E8352E` *everywhere*, including inside the pack's own icons: a new
+`theme.icon_svg()` reads each pack SVG, drops its rounded tile background,
+and maps its ink/accent/muted colors onto theme tokens as it loads. The
+pack files on disk are untouched -- they are the user's brand assets, and a
+pack updated tomorrow still works -- but the toolbar now renders them as
+line glyphs in the current theme instead of as a row of chips in the old
+palette. `mono=` collapses an icon to a single color, which is what the
+primary action uses so its glyph is white *on* the filled button rather
+than a pale sticker stuck to it.
+
+**A real alpha mark** (`native_app/assets/alpha-mark.svg`, and
+`alpha-badge.svg` on an accent squircle for the window/taskbar icon). The
+old one was an SVG `<text>` element setting the Greek letter in Georgia --
+so it rendered differently on every machine, and not at all where that font
+is missing. The new one is drawn as paths: an open bowl (a single elliptical
+arc) and a leg that crosses it and lands in a tail, stroked with round caps
+so it survives down to a 16px icon. It was drawn by rendering it at 200 /
+64 / 32px and adjusting until it read as an alpha at all three.
+
+**The ribbon's brand corner is gone.** A wordmark wedged into the left end
+of a working toolbar is decoration competing with the controls; the app's
+mark belongs on the window icon, which is where it now lives.
+
+**The Settings button has a mark that belongs to this app.** It never had a
+pack icon, so it fell through to a hand-drawn blue gradient square -- a
+chip in a palette the app doesn't own, which is exactly why it looked like
+it had wandered in from another program. Icon fallbacks are now
+`native_app/glyphs.py`: plain strokes drawn in the theme's ink (the tab
+strip's three marks moved there too). Settings' own glyph is two sliders,
+not a cogwheel -- the button opens shop and machine *parameters*, and a
+gear's teeth turn to mush below about 24px anyway.
+
+**View > Nesting Ribbon** ticks each toolbar item on or off, so a shop's
+toolbar carries what that shop actually uses; "Show All" puts everything
+back, and the choices are saved per item key with the rest of the session
+(`ribbon/<key>` in persistence.py -- per key, so adding a button later
+doesn't reset the choices already made about the others). Two details this
+dragged in:
+
+* A rule that ends up dividing nothing hides itself, so tidying the
+  toolbar can't leave a stray line behind. The check is `isVisibleTo()`,
+  not `isVisible()`: the saved choices are restored during `__init__`,
+  before the window is ever shown, when `isVisible()` is False for
+  everything in it -- which would have hidden all three rules permanently.
+* Because *every* item can be hidden, Run and Stop needed a home that
+  can't be: a new **Job** menu (Run Nesting `Ctrl+R`, Stop Nesting, Export
+  DXF, Commit to Inventory), which also gives the app its first keyboard
+  route to starting a nest. The preflight gate covers those actions too.
+
+Nine new tests (`tests/test_ribbon_items.py`) cover the ticks, the
+self-hiding rule, "Show All", the restart round-trip, the guarantee that
+hiding Run leaves a way to run, and `icon_svg()`'s recoloring in both
+normal and `mono` form. Suite: 126 tests.
+
 ## Files
 
 | File                  | Purpose                                                             |
@@ -910,9 +1116,12 @@ Two independent additions.
 | `remnant.py`          | Pure geometry: largest empty rectangle left on a cut sheet, for automatic remnant capture |
 | `commonline.py`       | Pure geometry: detects/splits exact shared edges between placed parts, for common-line cutting |
 | `nesting_widgets.py`  | The nesting UI itself (binding-agnostic `QWidget`), shared by the FreeCAD workbench and the native app — see "Native app" below |
-| `examples/`           | Demo `.FCStd` files, a sample `.dxf`, and a sample `inventory.json`, for trying either extractor/the workbench |
+| `examples/`           | Demo `.FCStd` files, a sample `.dxf`, and a sample `inventory.xlsx` (plus the legacy `inventory.json` it was converted from), for trying either extractor/the workbench |
 | `freecad_workbench/`  | The "Nesting" FreeCAD workbench — a thin FreeCAD-doc adapter around `nesting_widgets.py` — see "Workbench UI" below |
 | `native_app/`         | Standalone desktop app (no FreeCAD needed) around the same `nesting_widgets.py` — see "Native app" below |
+| `native_app/theme.py` | The app's design system: palette tokens, type ramp, and the app-wide Qt stylesheet built from them (plus `native_app/assets/`, the control glyphs QSS needs as images) |
+| `native_app/segmented.py` | The main tab strip: an Apple-style segmented control (rounded track, filled pill on the active tab) driving the bar-less `QTabWidget` |
+| `native_app/glyphs.py` | The small vector marks the app draws for itself (tab strip, Settings), stroked in the current theme's colors |
 
 ## Run it
 
@@ -1411,20 +1620,35 @@ A **File / Edit / View / Settings menu bar** sits above the ribbon:
   parts table — new capability, previously only "New Job" could clear
   anything), Remove Selected Stock Row (mirrors the Stock tab's own Delete
   Row button).
-- **View**: jump to the Nesting/Stock tab, Previous/Next Sheet.
+- **Job**: Run Nesting (Ctrl+R), Stop Nesting, Export DXF..., Commit to
+  Inventory... — the actions that can't live only on the ribbon, since
+  every ribbon item can be hidden (below).
+- **View**: jump to the Nesting/Stock/Parts tab, Previous/Next Sheet, and
+  **Nesting Ribbon**, a tick per toolbar item deciding what that ribbon
+  shows (saved with the session).
 - **Settings**: a checkable **Dark Mode** entry — this is the "toggle
   switch" for theme, deliberately placed as a menu item rather than a
   separate on-screen widget.
 
 **Icon pack & theme** (`native_app/theme.py`): the ribbon's icons come from
-a user-supplied `alphanest-icon-pack/` (light/dark SVG variants per action,
-plus an "AlphaNest" brand mark) when a pack icon exists for that button —
-"Commit to Inventory" has none, so it keeps a small hand-drawn glyph
-instead. Settings → Dark Mode doesn't just swap icons: it applies an
-app-wide Qt stylesheet built from the pack's own palette (dark red accent
-`#E8352E`, dark bg `#14161A`/`#1E2127` or light bg `#EEF0F3`), so the
-ribbon, menu bar, tables, and every other widget retint together — a dark
-icon sitting on an unthemed light ribbon strip would look broken.
+a user-supplied `alphanest-icon-pack/` when a pack icon exists for that
+button, recolored into the current theme as they load (`icon_svg()` — see
+Step 25); a button with no pack icon falls back to a glyph the app draws
+itself (`native_app/glyphs.py`). Settings → Dark Mode doesn't just swap
+icons: it applies an app-wide Qt stylesheet built from that theme's
+palette, so the ribbon, menu bar, tables, canvas and every other widget
+retint together — a dark icon sitting on an unthemed light ribbon strip
+would look broken.
+
+`theme.py` is the app's whole design system, not just a color swap: a
+palette of named tokens (surfaces, borders, three levels of text, the
+brand accent, canvas/sheet/grid colors), one font stack, one type ramp and
+one set of radii, rendered into the app-wide stylesheet. Widgets that
+paint themselves — the sheet preview, the Parts tab's part canvas — read
+the same tokens through `theme.tokens()`/`theme.color()` instead of
+hardcoding hexes, and `apply_theme()` pushes them into
+`nesting_widgets.set_sheet_palette()` so the sheet canvas follows the
+theme too. See Step 24 for the design rules those tokens encode.
 **Gotcha hit and fixed**: `QLabel` and `QTableWidget` both inherit from
 `QFrame` in Qt's class hierarchy, so an initial `QFrame { color: ... }`
 rule meant only for the ribbon's vertical separator lines was silently
@@ -1442,7 +1666,7 @@ day-to-day use.
 Run it with:
 ```bash
 python3 -m venv .venv                                     # a venv sidesteps Debian/Ubuntu's
-.venv/bin/pip install PySide6 pyclipper ezdxf              # "externally-managed-environment" pip block
+.venv/bin/pip install PySide6 pyclipper ezdxf openpyxl     # "externally-managed-environment" pip block
 .venv/bin/python native_app/main.py
 ```
 PySide6 is native-app-only (the FreeCAD workbench uses FreeCAD's own bundled
@@ -1508,32 +1732,30 @@ parts = load_parts("parts.json")  # material/thickness come through if
                                    # material:<Label>=<name> overrides
 
 # Preview -- in-memory only, run this as many times as you like:
-stock = load_inventory("inventory.json")
+stock = load_inventory("inventory.xlsx")
 for result in run_job(parts, stock, kerf=3.0):
     print(result.material, result.thickness, "->", len(result.sheets), "sheet(s)",
           "unplaced:", result.unplaced, "notes:", result.notes)
 
-# Actually cutting? This writes inventory.json's quantities back to disk
-# and appends to inventory.json.log.jsonl:
-commit_job(parts, "inventory.json", kerf=3.0)
+# Actually cutting? This writes inventory.xlsx's quantities back to disk
+# and appends to inventory.xlsx.log.jsonl:
+commit_job(parts, "inventory.xlsx", kerf=3.0)
 ```
 
-`inventory.json` shape (see `examples/inventory.json`):
-```json
-{"stock": [
-  {"id": "R-001", "material": "Mild Steel", "thickness": 2.0,
-   "width": 300, "height": 200, "quantity": 1, "is_remnant": true,
-   "price_per_kg": null, "density_g_cm3": 7.85, "scrap_price_per_kg": null},
-  {"material": "Mild Steel", "thickness": 2.0,
-   "width": 1220, "height": 2440, "quantity": 3, "is_remnant": false,
-   "price_per_kg": 1.85, "density_g_cm3": 7.85, "scrap_price_per_kg": 0.35}
-]}
-```
-`quantity: null` means unlimited (e.g. a standard sheet you can always
-reorder); a remnant's `quantity` is however many of that exact offcut are
-actually sitting in the shop. `price_per_kg`/`density_g_cm3`/
-`scrap_price_per_kg` are all optional (`null` = unpriced, same graceful
-degradation as a missing quantity) and all per ENTRY, not a single
+The inventory file is an **Excel workbook** — a `Stock` sheet, one row per
+stock entry, the same ten columns the Stock tab shows (see
+`examples/inventory.xlsx`, and Step 23 for why it isn't JSON any more):
+
+| ID | Material | Thickness (mm) | Width (mm) | Height (mm) | Quantity (blank=unlimited) | Remnant | Price/kg (blank=unpriced) | Density g/cm³ (blank=unpriced) | Scrap price/kg (blank=unpriced) |
+|----|----------|---------------|-----------|------------|---------------------------|---------|--------------------------|-------------------------------|--------------------------------|
+| R-001 | Mild Steel | 2 | 300 | 200 | 1 | Yes | | 7.85 | |
+| | Mild Steel | 2 | 1220 | 2440 | 3 | No | 1.85 | 7.85 | 0.35 |
+
+A blank `Quantity` means unlimited (e.g. a standard sheet you can always
+reorder); a remnant's quantity is however many of that exact offcut are
+actually sitting in the shop. `Price/kg`/`Density`/`Scrap price/kg` are all
+optional (blank = unpriced, same graceful degradation as a missing
+quantity) and all per ENTRY, not a single
 job-wide rate -- see the "Later revised" note under Step 13 for why cost
 is weight-derived rather than a flat per-sheet price, and why scrap value
 is priced per material too.
@@ -1541,7 +1763,7 @@ is priced per material too.
 The workbench UI has this built in: give each row in the parts table a
 Material (defaults to "unspecified" — there's no way to derive material
 from geometry, only `qty:`/`material:` overrides or a table edit), load an
-inventory JSON with the "Load Inventory JSON..." button, and "Run Nesting"
+inventory workbook with the "Load Inventory..." button, and "Run Nesting"
 groups/matches/cascades automatically — the sheet preview and DXF export
 both follow whichever stock size each sheet actually came from. Loading no
 inventory falls back to the simple single-sheet-size behavior (the Sheet

@@ -3,11 +3,17 @@ stock_panel.py
 --------------
 The native app's "Stock" tab: view and edit the currently loaded inventory
 (the same `panel._inventory_template`/`_inventory_path` the Nesting flow
-manages), rather than only being able to hand-edit the JSON file directly.
+manages), rather than only being able to hand-edit the stock file directly.
 It is also the home of the inventory FILE operations now: Load, and Clear
 (protected by a password confirmation). Saves/edits happen straight on the
-table below (Save writes back to the loaded JSON file). The ribbon no
-longer carries any of these.
+table below (Save writes back to the loaded workbook; Save As... writes a
+new one -- which is also how an inventory kept in the legacy JSON format
+becomes the .xlsx everything now expects). The ribbon no longer carries any
+of these.
+
+The stock list is stored as an Excel workbook, and this table is the same
+table: its columns come from `inventory.STOCK_COLUMNS`, the single
+definition the .xlsx layout is also built from, so the two can't drift.
 
 Also the home of the report's Currency picker and each stock entry's own
 Scrap price/kg column -- both used only by `NestingPanel._job_financials()`/
@@ -41,13 +47,49 @@ def check_clear_password(password):
     return password == CLEAR_PASSWORD
 
 
-COLUMNS = ["ID", "Material", "Thickness (mm)", "Width (mm)", "Height (mm)", "Quantity (blank=unlimited)",
-           "Remnant", "Price/kg (blank=unpriced)", "Density g/cm³ (blank=unpriced)",
-           "Scrap price/kg (blank=unpriced)"]
+# The workbook's own column layout (inventory.py), reused verbatim so the
+# sheet a user edits in Excel and the table they edit here are one table.
+# The table shows the short label and keeps the workbook's fuller heading
+# as the column's tooltip.
+COLUMNS = list(inventory.STOCK_COLUMN_LABELS)
+COLUMN_TOOLTIPS = list(inventory.STOCK_COLUMNS)
 _REMNANT_COL = len(COLUMNS) - 4
 _PRICE_COL = len(COLUMNS) - 3
 _DENSITY_COL = len(COLUMNS) - 2
 _SCRAP_PRICE_COL = len(COLUMNS) - 1
+# Numbers line up on their last digit, text doesn't: every measurement and
+# price column is right-aligned so a column of them can be read down.
+_NUMERIC_COLS = (2, 3, 4, 5, _PRICE_COL, _DENSITY_COL, _SCRAP_PRICE_COL)
+
+
+class _StockTable(QtWidgets.QTableWidget):
+    """The stock table gets the same desktop delete affordances as the parts
+    table (see _PartsTable in nesting_widgets.py): the Delete/Backspace key
+    and a right-click "Delete Rows" context menu. Without them the only way
+    to drop a bad row is the Edit menu item -- which users never find."""
+
+    delete_requested = QtCore.Signal()
+
+    def __init__(self, rows, columns, parent=None):
+        super().__init__(rows, columns, parent)
+        self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+    def keyPressEvent(self, event):
+        if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
+            self.delete_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _show_context_menu(self, pos):
+        row = self.rowAt(pos.y())
+        if row < 0:
+            return
+        self.selectRow(row)
+        menu = QtWidgets.QMenu(self)
+        menu.addAction("Delete Rows", self.delete_requested.emit)
+        menu.exec(self.viewport().mapToGlobal(pos))
 
 
 class StockPanel(QtWidgets.QWidget):
@@ -56,10 +98,25 @@ class StockPanel(QtWidgets.QWidget):
         self.panel = panel
 
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("Stock inventory")
+        title.setObjectName("PageTitle")
+        subtitle = QtWidgets.QLabel(
+            "The sheets and offcuts this shop has on hand. Parts are matched to stock by "
+            "material and thickness; the sheet size comes from whichever stock they matched."
+        )
+        subtitle.setObjectName("PageSubtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
 
         btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(8)
         load_btn = QtWidgets.QPushButton("Load Inventory...")
-        load_btn.setToolTip("Load stock from an inventory JSON file.")
+        load_btn.setToolTip("Load stock from an inventory workbook (.xlsx) -- or from an "
+                            "inventory JSON file written by an older version.")
         load_btn.clicked.connect(self.panel._load_inventory)
         clear_btn = QtWidgets.QPushButton("Clear Inventory")
         clear_btn.setObjectName("DestructiveAction")
@@ -69,7 +126,12 @@ class StockPanel(QtWidgets.QWidget):
         for b in (load_btn, clear_btn):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
-        btn_row.addWidget(QtWidgets.QLabel("Currency:"))
+        # Kept so a host with its own chrome (the native window's ribbon)
+        # can take these over and hide this row -- see hide_header_actions().
+        self._header_actions = [load_btn, clear_btn]
+        currency_label = QtWidgets.QLabel("Currency:")
+        self._header_actions.append(currency_label)
+        btn_row.addWidget(currency_label)
         self.currency = QtWidgets.QComboBox()
         self.currency.addItems(list(CURRENCY_SYMBOLS.keys()))
         self.currency.setCurrentText(self.panel.currency_code)
@@ -82,30 +144,73 @@ class StockPanel(QtWidgets.QWidget):
         btn_row.addWidget(self.currency)
         layout.addLayout(btn_row)
 
-        self.table = QtWidgets.QTableWidget(0, len(COLUMNS))
+        self.table = _StockTable(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        for col, tip in enumerate(COLUMN_TOOLTIPS):
+            item = self.table.horizontalHeaderItem(col)
+            item.setToolTip(tip)
+            # A heading sits over its own values: right above the numbers
+            # when the column holds numbers, centered over the checkbox.
+            if col in _NUMERIC_COLS:
+                item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            elif col == _REMNANT_COL:
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+        header = self.table.horizontalHeader()
+        # Ten columns of one table sharing the width evenly, the way the
+        # spreadsheet this mirrors does. (Stretching only the LAST column,
+        # as this did before, gave 40% of the table to "Scrap price/kg"
+        # while truncating four headings down to "tity (blank=unlin".)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(_REMNANT_COL, QtWidgets.QHeaderView.ResizeToContents)
+        header.setMinimumSectionSize(76)
+        header.setHighlightSections(False)
+        header.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.table.setShowGrid(False)          # hairline row rules only -- see theme.py
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.verticalHeader().setVisible(False)
-        layout.addWidget(self.table)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+        self.table.delete_requested.connect(self._delete_selected_rows)
+        layout.addWidget(self.table, 1)
 
-        self.status = QtWidgets.QLabel("No inventory loaded.")
-        layout.addWidget(self.status)
+        self.status = QtWidgets.QLabel(
+            "No inventory loaded -- nesting can still run, but add stock sheets here "
+            "(Load Inventory... or Add Row) once you want it to plan cost and material usage."
+        )
+        self.status.setObjectName("FieldHint")
+        self.status.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
         bottom_row = QtWidgets.QHBoxLayout()
+        bottom_row.setSpacing(8)
         add_row_btn = QtWidgets.QPushButton("Add Row")
         add_row_btn.clicked.connect(self._add_row)
         del_row_btn = QtWidgets.QPushButton("Delete Row")
         del_row_btn.clicked.connect(self._delete_selected_rows)
         save_btn = QtWidgets.QPushButton("Save")
-        save_btn.setToolTip("Writes the table below back to the loaded inventory JSON file.")
+        save_btn.setToolTip("Writes the table above back to the loaded inventory workbook. "
+                            "With nothing loaded, asks where to save it.")
         save_btn.clicked.connect(self._save)
-        for b in (add_row_btn, del_row_btn, save_btn):
+        save_as_btn = QtWidgets.QPushButton("Save As...")
+        save_as_btn.setToolTip("Writes the table above to a new inventory workbook (.xlsx) -- "
+                               "also how a legacy JSON inventory is moved over to Excel.")
+        save_as_btn.clicked.connect(self._save_as)
+        for b in (add_row_btn, del_row_btn, save_btn, save_as_btn):
             bottom_row.addWidget(b)
         bottom_row.addStretch(1)
+        bottom_row.addWidget(self.status)   # "<file> -- N entries", beside its own actions
         layout.addLayout(bottom_row)
 
         self.panel.inventory_changed.connect(self.refresh)
         self.refresh()
+
+    def hide_header_actions(self):
+        """Hide the Load / Clear / Currency row: the native window puts
+        those on its ribbon's Stock tab (it adopts `self.currency` itself),
+        and two copies of each, a few pixels apart, is one too many."""
+        for widget in self._header_actions:
+            widget.hide()
 
     # ------------------------------------------------------------ safety
 
@@ -123,7 +228,7 @@ class StockPanel(QtWidgets.QWidget):
         dlg_layout = QtWidgets.QVBoxLayout(dlg)
         prompt = QtWidgets.QLabel(
             "Are you sure you want to remove the loaded inventory?\n\n"
-            "This will drop every stock entry from the job (the JSON file on "
+            "This will drop every stock entry from the job (the file on "
             "disk is left untouched). Enter the password to confirm."
         )
         prompt.setWordWrap(True)
@@ -168,9 +273,13 @@ class StockPanel(QtWidgets.QWidget):
         for s in stock:
             self._append_row(s)
         path = self.panel._inventory_path
-        self.status.setText(
-            f"{os.path.basename(path)} -- {len(stock)} entries" if path else "No inventory loaded."
-        )
+        if path:
+            self.status.setText(f"{os.path.basename(path)} -- {len(stock)} entries")
+        else:
+            self.status.setText(
+                "No inventory loaded -- nesting can still run, but add stock sheets here "
+                "(Load Inventory... or Add Row) once you want it to plan cost and material usage."
+            )
 
     def _append_row(self, s):
         row = self.table.rowCount()
@@ -183,6 +292,7 @@ class StockPanel(QtWidgets.QWidget):
         self.table.setItem(row, 5, QtWidgets.QTableWidgetItem("" if s.quantity is None else str(s.quantity)))
         remnant_item = QtWidgets.QTableWidgetItem()
         remnant_item.setCheckState(QtCore.Qt.Checked if s.is_remnant else QtCore.Qt.Unchecked)
+        remnant_item.setTextAlignment(QtCore.Qt.AlignCenter)
         self.table.setItem(row, _REMNANT_COL, remnant_item)
         price_text = "" if s.price_per_kg is None else str(s.price_per_kg)
         self.table.setItem(row, _PRICE_COL, QtWidgets.QTableWidgetItem(price_text))
@@ -190,6 +300,10 @@ class StockPanel(QtWidgets.QWidget):
         self.table.setItem(row, _DENSITY_COL, QtWidgets.QTableWidgetItem(density_text))
         scrap_price_text = "" if s.scrap_price_per_kg is None else str(s.scrap_price_per_kg)
         self.table.setItem(row, _SCRAP_PRICE_COL, QtWidgets.QTableWidgetItem(scrap_price_text))
+        for col in _NUMERIC_COLS:
+            item = self.table.item(row, col)
+            if item is not None:
+                item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
     # --------------------------------------------------------------- edits
 
@@ -230,15 +344,42 @@ class StockPanel(QtWidgets.QWidget):
         return stock
 
     def _save(self):
+        """Save over the file this inventory came from. A table with no file
+        behind it yet -- built here with Add Row, or edited before anything
+        was loaded -- has nowhere to write back TO, so it falls through to
+        Save As rather than to an error message."""
         if not self.panel._inventory_path:
-            QtWidgets.QMessageBox.warning(self, "Stock", "No inventory file loaded -- use Load Inventory first.")
+            self._save_as()
             return
+        self._write(self.panel._inventory_path)
+
+    def _save_as(self):
+        current = self.panel._inventory_path
+        suggested = (os.path.splitext(current)[0] + inventory.DEFAULT_INVENTORY_EXTENSION
+                     if current else "inventory" + inventory.DEFAULT_INVENTORY_EXTENSION)
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save stock inventory as", suggested,
+            "Excel workbook (*.xlsx);;Inventory JSON, legacy (*.json)",
+        )
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += inventory.DEFAULT_INVENTORY_EXTENSION
+        self._write(path)
+
+    def _write(self, path):
         try:
             stock = self._rows_to_stock()
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self, "Stock", f"Could not parse a row (expected a number): {e}")
             return
-        inventory.save_inventory(self.panel._inventory_path, stock)
-        self.panel._inventory_template = stock
-        self.status.setText(f"{os.path.basename(self.panel._inventory_path)} -- {len(stock)} entries (saved).")
-        self.panel._log(f"Stock inventory saved to {self.panel._inventory_path}.")
+        try:
+            inventory.save_inventory(path, stock)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Stock", f"Could not save inventory: {e}")
+            return
+        # Routed through the panel (not a bare _inventory_template assignment)
+        # so a Save As actually REPOINTS the app at the new file -- the next
+        # Commit writes there, and the Nesting tab's status agrees.
+        self.panel._set_inventory(path, stock, f"Stock inventory saved to {path}.")
+        self.status.setText(f"{os.path.basename(path)} -- {len(stock)} entries (saved).")

@@ -76,7 +76,10 @@ boundary:
     given -- which would make it dead on arrival, since both front ends
     always pass one -- each generation's WINNING candidate alone is
     replayed once, serially, through the ordinary `evaluate()` closure
-    (which already forwards `on_placed=placement_callback`). This is
+    (which already forwards `on_placed=placement_callback`), in the main
+    process WHILE the workers evaluate the next generation (the base
+    order is replayed during the first one), so the view animates during
+    the wait instead of freezing through it. This is
     arguably a nicer live view than serial mode's, which fires the
     callback for every population member's every placement attempt.
   - `should_stop` is checked once per generation, before that generation's
@@ -283,6 +286,9 @@ def optimize_order(sheet_w: float, sheet_h: float, parts: List[Part], kerf: floa
         )
 
     best_fitness, best_sheets, best_unplaced = None, None, None
+    # Parallel mode's live-view replay target: the base order before the
+    # first generation, then each generation's winner.
+    replay = population[0]
     start = time.time()
 
     try:
@@ -296,16 +302,19 @@ def optimize_order(sheet_w: float, sheet_h: float, parts: List[Part], kerf: floa
                     return best_sheets, best_unplaced
                 futures = [executor.submit(_evaluate_in_worker, order_idx, rot_choice)
                            for order_idx, rot_choice in population]
+                if placement_callback is not None:
+                    # Replay the previous winner WHILE the workers run this
+                    # generation, purely to drive the live view -- replaying
+                    # it after the batch left the canvas frozen for the whole
+                    # batch and then flashed the replay by in a blink.
+                    evaluate(*replay)
                 for (order_idx, rot_choice), future in zip(population, futures):
                     fitness, sheets, unplaced = future.result()
                     scored.append((fitness, order_idx, rot_choice, sheets, unplaced))
                     if best_fitness is None or fitness < best_fitness:
                         best_fitness, best_sheets, best_unplaced = fitness, sheets, unplaced
                 scored.sort(key=lambda t: t[0])
-                if placement_callback is not None:
-                    # Replay only the generation's winner, serially, purely
-                    # to drive the live view -- see module docstring.
-                    evaluate(scored[0][1], scored[0][2])
+                replay = (scored[0][1], scored[0][2])
             else:
                 for order_idx, rot_choice in population:
                     if should_stop is not None and should_stop() and best_fitness is not None:

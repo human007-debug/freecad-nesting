@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="160" height="160">
+  <!-- The same mark on an accent squircle: the window/taskbar icon, where a
+       bare stroke glyph would disappear against a light or dark task bar. -->
+  <rect x="0" y="0" width="160" height="160" rx="37" fill="#FC4269"/>
+  <g transform="translate(80 82) scale(0.74) translate(-78 -87)"
+     fill="none" stroke="#FFFFFF" stroke-width="17" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 94 58 A 38 36 0 1 0 94 114"/>
+    <path d="M 97 52 C 89 74, 91 103, 123 129"/>
+  </g>
+</svg>

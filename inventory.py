@@ -40,6 +40,7 @@ see that module's docstring for the search and its honest cost.
 
 import datetime
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -99,16 +100,330 @@ class StockSheet:
         return weight * self.price_per_kg
 
 
-def load_inventory(path) -> List[StockSheet]:
+# ------------------------------------------------------------------ file I/O
+
+# The stock list is a TABLE -- one row per stock entry, the same columns the
+# Stock tab shows -- so its file format is a spreadsheet, not JSON. A .xlsx
+# is something the person who actually owns the stock can open, edit, sort,
+# filter and send on without going near a text editor or getting a comma
+# wrong; a .json is not. Excel is therefore the format `save_inventory()`
+# writes and the one new inventories should use.
+#
+# JSON is still READ (and still written back when the loaded path is a
+# .json), so inventories written before this change -- and anything a script
+# generates -- keep working untouched. `convert_inventory()` moves one over.
+EXCEL_EXTENSIONS = (".xlsx", ".xlsm")
+DEFAULT_INVENTORY_EXTENSION = ".xlsx"
+STOCK_SHEET_NAME = "Stock"
+
+
+def _is_excel_path(path) -> bool:
+    return os.path.splitext(str(path))[1].lower() in EXCEL_EXTENSIONS
+
+
+def _require_openpyxl():
+    """openpyxl is imported lazily, and only by the .xlsx paths: this module
+    is also imported inside FreeCAD's bundled Python, where an install can't
+    be assumed, and nothing but Excel I/O needs it there."""
+    try:
+        import openpyxl
+    except ImportError:
+        raise RuntimeError(
+            "Reading/writing an Excel stock file needs the openpyxl package "
+            "(pip install openpyxl)."
+        ) from None
+    return openpyxl
+
+
+# --- cell parsing -----------------------------------------------------------
+#
+# Every parser below takes a raw cell value, which -- because a human types
+# into these -- may be a real number, a string that looks like one, or blank.
+# Blank means "not set" everywhere: unlimited quantity, unpriced stock.
+
+_TRUE_WORDS = {"1", "y", "yes", "true", "t", "x", "remnant", "offcut"}
+_FALSE_WORDS = {"0", "n", "no", "false", "f", "sheet", "full", "full sheet", "new"}
+
+
+def _clean(value) -> str:
+    """A cell as trimmed text. Thousands separators are dropped so a width
+    typed as `1,220` reads the same as `1220`."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip().replace(",", "")
+
+
+def _parse_optional_text(value):
+    text = _clean(value)
+    return text or None
+
+
+def _parse_text(value) -> str:
+    return _clean(value)
+
+
+def _parse_float(value) -> float:
+    text = _clean(value)
+    return float(text) if text else 0.0
+
+
+def _parse_optional_float(value):
+    text = _clean(value)
+    return float(text) if text else None
+
+
+def _parse_optional_int(value):
+    text = _clean(value)
+    if not text:
+        return None
+    return int(float(text))  # `3.0` from a spreadsheet cell is still 3 sheets
+
+
+def _parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = _clean(value).lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text in _FALSE_WORDS or not text:
+        return False
+    raise ValueError(f"expected Yes or No, got {text!r}")
+
+
+def _format_bool(value):
+    return "Yes" if value else "No"
+
+
+def _format_plain(value):
+    return value
+
+
+# field name -> (column heading, parse cell -> value, format value -> cell).
+# This list IS the sheet layout: column order, headings and the Stock tab's
+# own columns all come from here, so the spreadsheet and the in-app table
+# can never drift apart.
+_STOCK_FIELDS = [
+    ("id", "ID", _parse_optional_text, _format_plain),
+    ("material", "Material", _parse_text, _format_plain),
+    ("thickness", "Thickness (mm)", _parse_float, _format_plain),
+    ("width", "Width (mm)", _parse_float, _format_plain),
+    ("height", "Height (mm)", _parse_float, _format_plain),
+    ("quantity", "Quantity (blank=unlimited)", _parse_optional_int, _format_plain),
+    ("is_remnant", "Remnant", _parse_bool, _format_bool),
+    ("price_per_kg", "Price/kg (blank=unpriced)", _parse_optional_float, _format_plain),
+    ("density_g_cm3", "Density g/cm³ (blank=unpriced)", _parse_optional_float, _format_plain),
+    ("scrap_price_per_kg", "Scrap price/kg (blank=unpriced)", _parse_optional_float, _format_plain),
+]
+
+STOCK_COLUMNS = [heading for _f, heading, _p, _fmt in _STOCK_FIELDS]
+# The same columns, shortened for the app's own table. The parenthesised
+# hint exists to make the SPREADSHEET self-explanatory -- a workbook has
+# nowhere else to say "blank means unlimited" -- but in the UI that's what
+# a tooltip is for, and a heading long enough to truncate says nothing.
+STOCK_COLUMN_LABELS = [heading.split("(")[0].strip() for heading in STOCK_COLUMNS]
+_PARSERS = {field: parse for field, _h, parse, _fmt in _STOCK_FIELDS}
+
+# Column headings people plausibly type instead of the canonical ones. Only
+# genuinely different WORDS need to live here -- spelling, case, spacing and
+# the parenthesised units/hints are all handled by _normalize_heading().
+_HEADING_ALIASES = {
+    "stockid": "id",
+    "sheetid": "id",
+    "qty": "quantity",
+    "count": "quantity",
+    "onhand": "quantity",
+    "isremnant": "is_remnant",
+    "offcut": "is_remnant",
+    "materialprice": "price_per_kg",
+}
+
+
+def _normalize_heading(text) -> str:
+    """`Thickness (mm)`, `thickness` and `THICKNESS` are the same column:
+    units and hints live in parentheses, so everything from the first `(` on
+    is dropped, then anything that isn't a letter or digit."""
+    head = str(text or "").split("(")[0].strip().lower()
+    return "".join(ch for ch in head if ch.isalnum())
+
+
+def _column_map(heading_row):
+    """{column index: field name} for one row of headings. Unrecognized
+    columns are ignored rather than fatal -- a shop that adds its own
+    `Supplier` or `Bin` column to the sheet keeps it, and we keep reading
+    the columns we know."""
+    canonical = {_normalize_heading(h): f for f, h, _p, _fmt in _STOCK_FIELDS}
+    mapping = {}
+    for index, cell in enumerate(heading_row):
+        norm = _normalize_heading(cell)
+        if not norm:
+            continue
+        field = canonical.get(norm) or _HEADING_ALIASES.get(norm)
+        if field is None:
+            # `Density` for `Density g/cm³`, `Price` for `Price/kg` -- a
+            # heading shortened (or lengthened) at the end still matches.
+            for canon_norm, canon_field in canonical.items():
+                if canon_norm.startswith(norm) or norm.startswith(canon_norm):
+                    field = canon_field
+                    break
+        if field is not None and field not in mapping.values():
+            mapping[index] = field
+    return mapping
+
+
+def _find_heading_row(rows):
+    """Index of the row that holds the column headings, or None. Searched
+    for (over the first 20 rows) rather than assumed to be row 1, so a sheet
+    carrying a title or a note above the table still loads."""
+    best, best_score = None, 0
+    for index, row in enumerate(rows[:20]):
+        score = len(_column_map(row))
+        if score > best_score:
+            best, best_score = index, score
+    return best if best_score >= 3 else None
+
+
+def _rows_to_stock(rows, heading_index, source) -> List[StockSheet]:
+    columns = _column_map(rows[heading_index])
+    stock = []
+    for offset, row in enumerate(rows[heading_index + 1:], start=heading_index + 2):
+        values = {"material": "", "thickness": 0.0, "width": 0.0, "height": 0.0}
+        for index, field in columns.items():
+            raw = row[index] if index < len(row) else None
+            try:
+                values[field] = _PARSERS[field](raw)
+            except ValueError as e:
+                raise ValueError(
+                    f"{source} row {offset}, column "
+                    f"{rows[heading_index][index]!r}: {e}"
+                ) from None
+        # A row is only an entry if it says WHAT it is -- blank spacer rows,
+        # and a trailing row holding nothing but a stray note, are skipped.
+        if not values.get("material") and not values.get("id"):
+            continue
+        stock.append(StockSheet(**values))
+    return stock
+
+
+def load_inventory_xlsx(path) -> List[StockSheet]:
+    """Read the stock table from an Excel workbook: the `Stock` sheet if
+    there is one, otherwise the first sheet."""
+    openpyxl = _require_openpyxl()
+    # data_only: a cell computed by a formula reads as its last value saved
+    # by Excel (a formula never saved by Excel has no cached value and reads
+    # as blank -- open and save the file in Excel once and it fills in).
+    workbook = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    try:
+        if STOCK_SHEET_NAME in workbook.sheetnames:
+            worksheet = workbook[STOCK_SHEET_NAME]
+        else:
+            worksheet = workbook.worksheets[0]
+        rows = [list(r) for r in worksheet.iter_rows(values_only=True)]
+    finally:
+        workbook.close()
+
+    heading_index = _find_heading_row(rows)
+    if heading_index is None:
+        raise ValueError(
+            f"{os.path.basename(str(path))} has no stock table: expected a heading row "
+            f"with columns like {', '.join(STOCK_COLUMNS[:5])}."
+        )
+    return _rows_to_stock(rows, heading_index, os.path.basename(str(path)))
+
+
+def save_inventory_xlsx(path, stock: List[StockSheet]):
+    """Write the stock table to an Excel workbook, styled to be worked in:
+    frozen, bold headings, a filter row, Yes/No validation on Remnant.
+
+    Any OTHER sheet in an existing workbook is left alone -- a shop's own
+    notes/pricing tab lives on across the rewrite that every committed job
+    triggers (see `commit_job()`); only the `Stock` sheet is ours."""
+    openpyxl = _require_openpyxl()
+    from openpyxl.styles import Alignment, Font
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    workbook, index = None, 0
+    if os.path.exists(path):
+        try:
+            workbook = openpyxl.load_workbook(path)
+        except Exception:
+            workbook = None  # not a workbook we can read -- replace it wholesale
+    if workbook is None:
+        workbook = openpyxl.Workbook()
+        workbook.remove(workbook.active)
+    elif STOCK_SHEET_NAME in workbook.sheetnames:
+        previous = workbook[STOCK_SHEET_NAME]
+        index = workbook.index(previous)
+        workbook.remove(previous)
+    worksheet = workbook.create_sheet(STOCK_SHEET_NAME, index)
+
+    worksheet.append(STOCK_COLUMNS)
+    for s in stock:
+        worksheet.append([fmt(getattr(s, field)) for field, _h, _p, fmt in _STOCK_FIELDS])
+
+    for column, heading in enumerate(STOCK_COLUMNS, start=1):
+        cell = worksheet.cell(row=1, column=column)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        worksheet.column_dimensions[get_column_letter(column)].width = min(
+            26, max(11, len(heading) + 2)
+        )
+    worksheet.freeze_panes = "A2"
+    last_row = max(2, worksheet.max_row)
+    worksheet.auto_filter.ref = f"A1:{get_column_letter(len(STOCK_COLUMNS))}{last_row}"
+
+    remnant_column = get_column_letter(
+        [f for f, _h, _p, _fmt in _STOCK_FIELDS].index("is_remnant") + 1
+    )
+    remnant_choices = DataValidation(type="list", formula1='"Yes,No"', allow_blank=True)
+    worksheet.add_data_validation(remnant_choices)
+    # A generous range, not just the rows written: the dropdown should be
+    # there for the rows the user is about to ADD, which is the whole point.
+    remnant_choices.add(f"{remnant_column}2:{remnant_column}{last_row + 200}")
+
+    workbook.save(path)
+
+
+def load_inventory_json(path) -> List[StockSheet]:
     with open(path) as f:
         data = json.load(f)
     return [StockSheet(**s) for s in data["stock"]]
 
 
-def save_inventory(path, stock: List[StockSheet]):
+def save_inventory_json(path, stock: List[StockSheet]):
     payload = {"stock": [vars(s) for s in stock]}
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
+
+
+def load_inventory(path) -> List[StockSheet]:
+    """Read a stock list from `path`, Excel or (legacy) JSON, decided by the
+    file extension."""
+    if _is_excel_path(path):
+        return load_inventory_xlsx(path)
+    return load_inventory_json(path)
+
+
+def save_inventory(path, stock: List[StockSheet]):
+    """Write `stock` back to `path` in whatever format that path names --
+    so a job committed against a legacy .json inventory stays .json instead
+    of quietly becoming a workbook the caller never asked for."""
+    if _is_excel_path(path):
+        save_inventory_xlsx(path, stock)
+    else:
+        save_inventory_json(path, stock)
+
+
+def convert_inventory(src, dest=None) -> str:
+    """Rewrite an inventory in the other format -- in practice, an old
+    .json one as the .xlsx everything now expects. Returns the path written
+    (`src` with a .xlsx extension when `dest` is omitted)."""
+    if dest is None:
+        dest = os.path.splitext(str(src))[0] + DEFAULT_INVENTORY_EXTENSION
+    save_inventory(dest, load_inventory(src))
+    return dest
 
 
 GroupKey = Tuple[str, float]

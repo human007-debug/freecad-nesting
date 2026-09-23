@@ -1,449 +1,426 @@
 """
 ribbon.py
 ---------
-The native app's ribbon -- one compact stack, no sub-tabs, no scrollbars:
+The native app's ribbon, laid out the way CAM nesting suites (Lantek,
+LaserNest, RADAN) lay theirs out: a row of ribbon TABS (Parts / Stock /
+Nesting / Output / View), and under it one page per tab made of captioned GROUPS.
+Each group holds large icon-over-label buttons for its main actions and
+stacks of up to three small icon-beside-label rows (buttons, checkboxes,
+compact fields) for the secondary ones, with the group's name underneath
+and an optional corner launcher that opens the full settings for it.
 
-  Row 1  The action toolbar (icon + text per button, thin separators
-         between logical clusters): Run / Stop | Export DXF / Report.
-         Always visible, never scrolls.
+    ribbon = Ribbon()
+    page = ribbon.add_tab("Home")
+    nest = page.add_group("Nest")
+    run = nest.add_large("run-nesting", "▶", "Run\\nNesting", primary=True)
+    stack = nest.add_small("stop-nesting", "■", "Stop")
 
-  Below  EVERY settings group box the shared `NestingPanel` builds,
-         flattened into narrow single-column boxes grouped under a short
-         section caption (Layout / Rules / Cutting / Stock / Export). The
-         sections flow left-to-right and wrap onto new rows as the window
-         narrows, so the layout ALWAYS fits -- there is no horizontal
-         scrollbar; the band simply grows taller instead. A tall row of
-         settings costs vertical space, but that is the deal for "everything
-         always fits" (and it scales with the window width automatically).
+The ribbon only lays controls out and paints them; main_window.py wires
+every button to a real, already-working `NestingPanel`/`FilePartSource`
+method -- no disabled placeholders for features that don't exist yet.
 
-The 5 settings sub-tabs are gone; duplicates with the Parts/Stock tabs and
-mirrors of the log were dropped (the Assembly quantity row lives on the
-Parts tab now, the inventory-status line and the GA/cost/report operational
-labels live elsewhere), and the Microjoints toggle lives on its checkbox in
-the Cutting settings -- not as a toolbar button -- so the settings stack
-stays compact.
-
-The shared `NestingPanel` builds all of its settings group boxes in
-`settings_boxes` (grouped by the old tab title) and the window reparents
-them in here, so the settings live in the ribbon for the native app but stay
-in the panel's own scroll area in the FreeCAD workbench.
-
-Icons come from the user-supplied `alphanest-icon-pack/` when available
-(see theme.py's `icon_path()`), matched by name to each button, with a
-light/dark variant swapped on `set_theme()`. Adding a new toolbar action's
-icon later needs no code change here: drop `icon-<name>.svg` into both
-`alphanest-icon-pack/icons/dark/` and `.../light/` (96x96 viewBox, a
-rounded-rect background matching the theme, and an accent-red `#E8352E`
-glyph on top -- see any existing pack icon for the exact pattern), then
-pass that `<name>` to `add_button()`. A button whose action has no pack
-icon falls back to a small `QPainter`-drawn gradient-square glyph instead
--- no external asset needed, and it stays visually consistent with the
-surrounding pack icons' rounded-square shape.
-
-Every button this app actually adds calls a real, already-working
-`NestingPanel`/`FilePartSource` method directly (see main_window.py) --
-no disabled placeholders for features that don't exist yet.
+Icons come from the user-supplied `alphanest-icon-pack/` when available,
+recolored into the current theme as they load (see theme.py's
+`icon_svg()`). A new action's icon needs no code change here: drop
+`icon-<name>.svg` into both `alphanest-icon-pack/icons/dark/` and
+`.../light/` (96x96 viewBox) and pass that `<name>`. A button with no pack
+icon falls back to a glyph this app draws itself (`glyphs.py`), and
+failing that to its own character drawn in the theme's ink.
 """
+
+import re
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from native_app import theme
+from native_app import glyphs, theme
 
-
-_ICON_TOP = QtGui.QColor("#5c93c9")
-_ICON_BOTTOM = QtGui.QColor("#1f4d80")
-
-# Glyph fallbacks are painted 96x96 and downscaled by QIcon to the button's
-# real icon size. Downscaling stays crisp; the old 32px render was accurate
-# at 32 but got UPSCALED to the 44px button icon, which is what made any
-# fallback icon look soft/wonky.
-_GLYPH_RENDER = 96
-
-# Pack icons are re-rasterized 2x the button's real icon size with Qt's own
-# renderer and stored with devicePixelRatio 2, so Qt downscales them instead
-# of the SVG loading raster scaled up -- the edges stay crisp instead of
-# going soft/mushy (the "wonky" look). Cached per file so repeated
-# light/dark theme swaps don't re-rasterize.
-_PACK_RENDER = 80
-_PACK_ICON_SIZE = 40
+LARGE_ICON_PX = 32
+SMALL_ICON_PX = 16
+# Pixel height of a group's content area: three small rows, or one large
+# button, whichever the group has -- every group shares it so captions
+# line up across the whole page.
+_CONTENT_HEIGHT = 78
 _ICON_CACHE = {}
+# The pack draws its artwork inside roughly the middle 64 units of a 96-unit
+# tile, leaving a margin for the tile's rounded corners. The tile is gone
+# here (theme.icon_svg), so rendering the full 96 box would leave every
+# pack icon a third smaller than the app's own glyphs beside it -- crop to
+# the artwork instead.
+_PACK_ARTWORK = QtCore.QRectF(14, 14, 68, 68)
+_STROKE_RE = re.compile(r'stroke-width="([0-9.]+)"')
 
 
-def _glyph_icon(glyph, size=_GLYPH_RENDER):
-    pix = QtGui.QPixmap(size, size)
-    pix.fill(QtCore.Qt.transparent)
-    painter = QtGui.QPainter(pix)
+def _render_svg(svg, px):
+    """Rasterize themed SVG source (see theme.icon_svg) at 2x, marked as
+    such, so Qt downscales instead of upscaling and edges stay crisp."""
+    from PySide6 import QtSvg
+
+    if px <= SMALL_ICON_PX:
+        # At 16px the pack's ~3.3-unit strokes land under a pixel wide and
+        # go grey; thicken them so small icons carry the same weight as
+        # the text beside them.
+        svg = _STROKE_RE.sub(lambda m: f'stroke-width="{float(m.group(1)) * 1.5:.2f}"', svg)
+    renderer = QtSvg.QSvgRenderer(QtCore.QByteArray(svg.encode("utf-8")))
+    renderer.setViewBox(_PACK_ARTWORK)
+    ratio = 2
+    pixmap = QtGui.QPixmap(px * ratio, px * ratio)
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+    # Explicit bounds: render(painter) alone lays the SVG out at its own
+    # 96px default size and clips everything past the canvas.
+    renderer.render(painter, QtCore.QRectF(0, 0, px, px))
+    painter.end()
+    return glyphs.untinted(pixmap)
+
+
+def _char_icon(char, color, px):
+    """Last resort: the button's own character, drawn in the theme's ink."""
+    ratio = 2
+    pixmap = QtGui.QPixmap(px * ratio, px * ratio)
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
     painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
     painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
-
-    grad = QtGui.QLinearGradient(0, 0, 0, size)
-    grad.setColorAt(0, _ICON_TOP)
-    grad.setColorAt(1, _ICON_BOTTOM)
-    painter.setPen(QtCore.Qt.NoPen)
-    painter.setBrush(grad)
-    painter.drawRoundedRect(0, 0, size, size, round(size * 0.19), round(size * 0.19))
-
-    painter.setPen(QtGui.QColor("white"))
+    painter.setPen(color)
     font = painter.font()
-    font.setPixelSize(int(size * 0.52))
-    font.setBold(True)
+    font.setPixelSize(int(px * ratio * 0.78))
     painter.setFont(font)
-    painter.drawText(pix.rect(), QtCore.Qt.AlignCenter, glyph)
+    painter.drawText(pixmap.rect(), QtCore.Qt.AlignCenter, char)
     painter.end()
-    return QtGui.QIcon(pix)
+    return glyphs.untinted(pixmap)
 
 
-def _button_icon(icon_name, glyph, dark):
-    """Icon for a ribbon button: the pack SVG for the named action, or the
-    hand-drawn glyph fallback if the pack has no such icon (see the module
-    docstring)."""
-    path = theme.icon_path(icon_name, dark)
-    if not path:
-        return _glyph_icon(glyph)
-    cached = _ICON_CACHE.get(path)
+def button_icon(icon_name, char, dark, px, mono=None):
+    """Icon for a ribbon button, in order of preference: the pack's own
+    SVG recolored to this theme, a glyph this app draws itself, or the
+    button's character. `mono` forces the whole icon into one color --
+    what the primary action uses so its glyph is white on the accent."""
+    key = (icon_name, char, dark, px, mono)
+    cached = _ICON_CACHE.get(key)
     if cached is not None:
         return cached
-    try:
-        from PySide6 import QtSvg
-        renderer = QtSvg.QSvgRenderer(path)
-        pm = QtGui.QPixmap(_PACK_RENDER, _PACK_RENDER)
-        pm.fill(QtCore.Qt.transparent)
-        painter = QtGui.QPainter(pm)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
-        renderer.render(painter)
-        painter.end()
-        pm.setDevicePixelRatio(_PACK_RENDER / float(_PACK_ICON_SIZE))
-        ico = QtGui.QIcon(pm)
-    except Exception:
-        ico = QtGui.QIcon(path)
-    _ICON_CACHE[path] = ico
-    return ico
+
+    palette = theme.tokens(dark)
+    ink = QtGui.QColor(mono or palette["text"])
+    svg = theme.icon_svg(icon_name, dark, mono=mono)
+    if svg is not None:
+        icon = _render_svg(svg, px)
+    elif icon_name in glyphs.GLYPHS:
+        accent = QtGui.QColor(mono or palette["accent"])
+        icon = glyphs.glyph_icon(icon_name, ink, QtGui.QColor(palette["raised"]), size=px, accent=accent)
+    else:
+        icon = _char_icon(char, ink, px)
+    _ICON_CACHE[key] = icon
+    return icon
 
 
 class RibbonButton(QtWidgets.QToolButton):
-    """A slim toolbar action: small icon beside a single-line label. Sized
-    to its own text so buttons don't waste width on blanket fixed sizes --
-    they sit in one tidy left-aligned toolbar row (~470 px total), leaving
-    the rest of the width to the settings sections."""
-    def __init__(self, icon_name, glyph, text, parent=None):
+    """One ribbon action, in one of two sizes:
+
+    * large -- a 32px icon over a (one- or two-line) label, for the
+      actions a group exists for;
+    * small -- a 16px icon beside a single-line label, stacked up to three
+      high, for the secondary ones.
+
+    `primary=True` marks the ONE action that matters most (Run Nesting):
+    filled in the accent so it's never mistaken for its neighbours. Looks
+    live in theme.py's app-wide sheet, keyed off the object names set
+    here, so a theme swap restyles every button at once."""
+
+    def __init__(self, icon_name, glyph, text, parent=None, large=False, primary=False):
         super().__init__(parent)
         self._icon_name = icon_name
         self._glyph = glyph
+        self._primary = primary
+        self._large = large
+        if primary:
+            self.setObjectName("PrimaryRibbonAction")
+        else:
+            self.setObjectName("RibbonLarge" if large else "RibbonSmall")
         self.setText(text)
-        self.setIconSize(QtCore.QSize(22, 22))
-        self.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self.setAutoRaise(True)
-        self.setStyleSheet("QToolButton { font-size: 11px; padding: 4px 8px; font-weight: 600; }")
-        text_w = max(self.fontMetrics().horizontalAdvance(line) for line in text.splitlines())
-        self.setFixedSize(max(88, text_w + 22 + 4 + 22), 40)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        px = LARGE_ICON_PX if large else SMALL_ICON_PX
+        self.setIconSize(QtCore.QSize(px, px))
+        if large:
+            self.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
+            self.setFixedHeight(_CONTENT_HEIGHT)
+            self.setMinimumWidth(56)
+        else:
+            self.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+            self.setFixedHeight(_CONTENT_HEIGHT // 3)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self.set_theme(False)
 
     def set_theme(self, dark):
-        self.setIcon(_button_icon(self._icon_name, self._glyph, dark))
+        mono = theme.tokens(dark)["on_accent"] if self._primary else None
+        px = LARGE_ICON_PX if self._large else SMALL_ICON_PX
+        self.setIcon(button_icon(self._icon_name, self._glyph, dark, px, mono=mono))
 
 
-class _FlowLayout(QtWidgets.QLayout):
-    """Left-to-right, wrap-to-next-row layout (Qt's stock flow layout):
-    children keep their natural size and line up in rows that wrap when the
-    available width runs out. This is what lets the settings sections always
-    fit -- they simply flow onto more rows instead of scrolling. The height
-    for a given width is reported through heightForWidth(), so the ribbon
-    auto-grows to exactly what the current window width needs."""
+class RibbonGroup(QtWidgets.QFrame):
+    """A captioned cluster of controls on a ribbon page. Controls flow left
+    to right: each large button is its own column, and consecutive small
+    items fill a column three rows deep before starting the next one.
 
-    def __init__(self, parent=None):
+    A group whose every control has been hidden (View > Ribbon Items)
+    hides itself too -- see `refresh_visibility()` -- so a page never shows
+    an empty caption over nothing."""
+
+    launcher_clicked = QtCore.Signal()
+
+    def __init__(self, title, parent=None, launcher=False):
         super().__init__(parent)
-        self._hgap = 6
-        self._vgap = 4
+        self.setObjectName("RibbonGroup")
+        self.title = title
         self._items = []
-        self.setContentsMargins(2, 2, 2, 2)
+        self._column = None   # the small-item stack currently being filled
+        self._column_rows = 0  # rows of it already used (a block can take more than one)
 
-    def addItem(self, item):
-        self._items.append(item)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(6, 0, 6, 0)
+        outer.setSpacing(2)
 
-    def count(self):
-        return len(self._items)
+        content = QtWidgets.QWidget(self)
+        content.setObjectName("RibbonGroupContent")
+        content.setFixedHeight(_CONTENT_HEIGHT)
+        self._row = QtWidgets.QHBoxLayout(content)
+        self._row.setContentsMargins(0, 0, 0, 0)
+        self._row.setSpacing(2)
+        outer.addWidget(content)
 
-    def itemAt(self, index):
-        if 0 <= index < len(self._items):
-            return self._items[index]
-        return None
+        caption_row = QtWidgets.QHBoxLayout()
+        caption_row.setContentsMargins(0, 0, 0, 0)
+        caption_row.setSpacing(0)
+        caption = QtWidgets.QLabel(title, self)
+        caption.setObjectName("RibbonGroupCaption")
+        caption.setAlignment(QtCore.Qt.AlignCenter)
+        caption_row.addWidget(caption, 1)
+        self.launcher = None
+        if launcher:
+            # The corner arrow Office-style ribbons use for "the rest of
+            # this group's options" -- here, the matching section of the
+            # Nesting Settings dialog.
+            self.launcher = QtWidgets.QToolButton(self)
+            self.launcher.setObjectName("RibbonLauncher")
+            self.launcher.setText("↘")
+            self.launcher.setAutoRaise(True)
+            self.launcher.setCursor(QtCore.Qt.PointingHandCursor)
+            self.launcher.setToolTip(f"All {title.lower()} settings...")
+            self.launcher.clicked.connect(self.launcher_clicked)
+            caption_row.addWidget(self.launcher, 0, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        outer.addLayout(caption_row)
 
-    def takeAt(self, index):
-        if 0 <= index < len(self._items):
-            return self._items.pop(index)
-        return None
+    @property
+    def items(self):
+        return list(self._items)
 
-    def expandingDirections(self):
-        return QtCore.Qt.Orientations()
+    def add_large(self, icon_name, glyph, text, primary=False, checkable=False):
+        btn = RibbonButton(icon_name, glyph, text, self, large=True, primary=primary)
+        btn.setCheckable(checkable)
+        self._column = None
+        self._row.addWidget(btn, 0, QtCore.Qt.AlignTop)
+        self._items.append(btn)
+        return btn
 
-    def hasHeightForWidth(self):
-        return True
+    def new_column(self):
+        """Start the next small item in a fresh stack, even if the current
+        one has room -- for keeping related items together."""
+        self._column = None
 
-    def heightForWidth(self, width):
-        return self._arrange(width, None)
+    def add_small(self, icon_name, glyph, text, checkable=False):
+        btn = RibbonButton(icon_name, glyph, text, self, large=False)
+        btn.setCheckable(checkable)
+        self._add_to_stack(btn)
+        return btn
 
-    def setGeometry(self, rect):
-        super().setGeometry(rect)
-        self._arrange(rect.width(), rect)
+    def add_widget(self, widget, label=None, rows=1):
+        """Adopt an existing widget (a checkbox, a spin box, a combo) as one
+        small row -- with a caption beside it when `label` is given. The
+        row, not the bare widget, is what View > Ribbon Items hides, so the
+        caption goes with it; the row is returned for exactly that.
+        `rows` > 1 gives a taller block (e.g. a 2x2 grid of fields) that
+        many rows of the stack."""
+        if label is None:
+            row = widget
+        else:
+            row = QtWidgets.QWidget(self)
+            row.setObjectName("RibbonFieldRow")
+            lay = QtWidgets.QHBoxLayout(row)
+            lay.setContentsMargins(4, 0, 0, 0)
+            lay.setSpacing(6)
+            caption = QtWidgets.QLabel(label, row)
+            caption.setObjectName("RibbonFieldLabel")
+            lay.addWidget(caption)
+            lay.addWidget(widget)
+        widget.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        row.setFixedHeight(rows * _CONTENT_HEIGHT // 3)
+        self._add_to_stack(row, rows)
+        widget.show()
+        return row
 
-    def sizeHint(self):
-        return self.minimumSize()
+    def _add_to_stack(self, widget, rows=1):
+        if self._column is None or self._column_rows + rows > 3:
+            self._column_rows = 0
+            self._column = QtWidgets.QVBoxLayout()
+            self._column.setContentsMargins(0, 0, 0, 0)
+            self._column.setSpacing(0)
+            self._column.setAlignment(QtCore.Qt.AlignTop)
+            self._row.addLayout(self._column)
+        self._column.addWidget(widget, 0, QtCore.Qt.AlignLeft)
+        self._column_rows += rows
+        self._items.append(widget)
 
-    def minimumSize(self):
-        m = self.contentsMargins()
-        w = max((it.minimumSize().width() for it in self._items), default=0)
-        h = max((it.minimumSize().height() for it in self._items), default=0)
-        return QtCore.QSize(w + m.left() + m.right(), h + m.top() + m.bottom())
+    def refresh_visibility(self):
+        # isHidden(), not isVisible(): a group on a ribbon page that isn't
+        # the current one is invisible without anyone having hidden it.
+        self.setVisible(any(not w.isHidden() for w in self._items))
 
-    def _arrange(self, width, rect):
-        m = self.contentsMargins()
-        eff = width - m.left() - m.right()
-        x = m.left()
-        y = m.top()
-        row_h = 0
-        for it in self._items:
-            sh = it.sizeHint()
-            if x + sh.width() > m.left() + eff + 1 and x > m.left():
-                x = m.left()
-                y += row_h + self._vgap
-                row_h = 0
-            if rect is not None:
-                it.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), sh))
-            x += sh.width() + self._hgap
-            row_h = max(row_h, sh.height())
-        return y + row_h + m.bottom()
+
+class RibbonPage(QtWidgets.QWidget):
+    """One ribbon tab's content: groups left to right, divided by hairlines."""
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.setObjectName("RibbonPage")
+        self.title = title
+        self.groups = []
+        self._lay = QtWidgets.QHBoxLayout(self)
+        self._lay.setContentsMargins(8, 6, 8, 4)
+        self._lay.setSpacing(0)
+        self._lay.addStretch(1)
+        self._separators = []
+
+    def add_group(self, title, launcher=False):
+        index = self._lay.count() - 1   # before the trailing stretch
+        if self.groups:
+            sep = QtWidgets.QFrame(self)
+            sep.setObjectName("RibbonSeparator")
+            sep.setFrameShape(QtWidgets.QFrame.VLine)
+            self._lay.insertWidget(index, sep)
+            self._separators.append(sep)
+            index += 1
+        group = RibbonGroup(title, self, launcher=launcher)
+        self._lay.insertWidget(index, group)
+        self.groups.append(group)
+        return group
+
+    def refresh_visibility(self):
+        for group in self.groups:
+            group.refresh_visibility()
+        # A rule belongs to the group after it; with no visible group on
+        # BOTH sides, it would just divide nothing.
+        visible = [not g.isHidden() for g in self.groups]
+        for i, sep in enumerate(self._separators, start=1):
+            sep.setVisible(visible[i] and any(visible[:i]))
+
+
+class _PageScroll(QtWidgets.QScrollArea):
+    """Holds one ribbon page. A page wider than the window scrolls sideways
+    instead of forcing the whole window to its width, and the scroll area
+    grows by the scrollbar's height only while one is actually showing, so
+    the group captions are never clipped by it."""
+
+    def __init__(self, page, parent=None):
+        super().__init__(parent)
+        self.setObjectName("RibbonPageScroll")
+        self.setWidget(page)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        self._fit_height()
+
+    def _fit_height(self):
+        page = self.widget()
+        needs_bar = page.minimumSizeHint().width() > self.viewport().width() + 1
+        bar = self.horizontalScrollBar().sizeHint().height() if needs_bar else 0
+        self.setFixedHeight(page.sizeHint().height() + bar)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_height()
 
 
 class Ribbon(QtWidgets.QWidget):
+    """Tab row + stacked pages. `current_changed(index)` fires when the user
+    switches ribbon tab (persisted by persistence.py)."""
+
+    current_changed = QtCore.Signal(int)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("Ribbon")
-
+        self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Toolbar row: slim action buttons, left-aligned, one flat line.
-        toolbar = QtWidgets.QWidget(self)
-        self._actions_lay = QtWidgets.QHBoxLayout(toolbar)
-        self._actions_lay.setContentsMargins(8, 3, 8, 3)
-        self._actions_lay.setSpacing(5)
-        outer.addWidget(toolbar)
+        tab_row = QtWidgets.QWidget(self)
+        tab_row.setObjectName("RibbonTabRow")
+        tab_row.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        self._tab_lay = QtWidgets.QHBoxLayout(tab_row)
+        self._tab_lay.setContentsMargins(10, 4, 10, 0)
+        self._tab_lay.setSpacing(2)
+        self._tab_lay.addStretch(1)
+        outer.addWidget(tab_row)
 
-        rule = QtWidgets.QFrame(self)
-        rule.setFrameShape(QtWidgets.QFrame.HLine)
-        rule.setStyleSheet("color: #3d424a;")
-        outer.addWidget(rule)
+        self._stack = QtWidgets.QStackedWidget(self)
+        self._stack.setObjectName("RibbonBody")
+        outer.addWidget(self._stack)
 
-        # Settings flow: every section wraps to the next row when it needs
-        # to, so the whole width always fits with no horizontal scrollbar.
-        # Height is derived from the current width (see _FlowLayout), so the
-        # band auto-grows instead of pinning the content to a maximum.
-        self._flow = _FlowLayout()
-        content = QtWidgets.QWidget(self)
-        self._flow_container = content
-        content.setLayout(self._flow)
-        # Compact the settings forms that live in the ribbon (forms are for
-        # the FreeCAD panel too, but only the ribbon needs them cramped):
-        # smaller labels/checkboxes, tight group-box padding, and shorter
-        # number-entry boxes so the sections stay narrow.
-        content.setStyleSheet(
-            "QLabel, QCheckBox { font-size: 10px; }"
-            " QGroupBox { font-size: 10px; padding-top: 4px; }"
-            " QSpinBox, QDoubleSpinBox { min-height: 18px; max-height: 22px; }"
-        )
-        outer.addWidget(content)
+        self._tab_group = QtWidgets.QButtonGroup(self)
+        self._tab_group.setExclusive(True)
+        self._tab_group.idClicked.connect(self.set_current_index)
+        self.pages = []
 
-        # add_button()/add_separator()/add_stretch() land here while the
-        # window builds the action toolbar; add_settings_tab() appends
-        # directly to the flow.
-        self._current_layout = self._actions_lay
+    def add_tab(self, title):
+        page = RibbonPage(title)
+        tab = QtWidgets.QToolButton()
+        tab.setObjectName("RibbonTab")
+        tab.setText(title)
+        tab.setCheckable(True)
+        tab.setCursor(QtCore.Qt.PointingHandCursor)
+        self._tab_group.addButton(tab, len(self.pages))
+        self._tab_lay.insertWidget(len(self.pages), tab)
+        self._stack.addWidget(_PageScroll(page))
+        self.pages.append(page)
+        if len(self.pages) == 1:
+            tab.setChecked(True)
+        return page
 
-    def add_button(self, icon_name, glyph, text, checkable=False):
-        btn = RibbonButton(icon_name, glyph, text, self)
-        btn.setCheckable(checkable)
-        self._current_layout.addWidget(btn)
-        return btn
+    def add_corner_widget(self, widget):
+        """A widget at the far right of the tab row (after the stretch)."""
+        self._tab_lay.addWidget(widget)
 
-    def add_separator(self):
-        sep = QtWidgets.QFrame(self)
-        sep.setObjectName("RibbonSeparator")
-        sep.setFrameShape(QtWidgets.QFrame.VLine)
-        sep.setFixedHeight(28)
-        self._current_layout.addWidget(sep)
+    def current_index(self):
+        return self._stack.currentIndex()
 
-    def add_stretch(self):
-        self._current_layout.addStretch(1)
+    def set_current_index(self, index):
+        if not 0 <= index < len(self.pages):
+            return
+        self._tab_group.button(index).setChecked(True)
+        if index != self._stack.currentIndex():
+            self._stack.setCurrentIndex(index)
+            self.current_changed.emit(index)
 
-    @staticmethod
-    def _compact_settings_box(box):
-        """Cram a settings group box so its section stays narrow: tight
-        group-box margins, thin form/row spacing, and each number box sized
-        by its OWN range's widest text instead of one blanket width -- a
-        margin spin that maxes at "1000.0 mm" is barely wider than the
-        spinner, while a min-area spin that can reach "1000000000 mm²" still
-        gets enough room. No box is comically wide just because another one
-        might be."""
-        lay = box.layout()
-        if lay is not None:
-            lay.setContentsMargins(6, 4, 6, 4)
-        for form in box.findChildren(QtWidgets.QFormLayout):
-            form.setVerticalSpacing(0)
-            form.setHorizontalSpacing(4)
-        for vbox in box.findChildren(QtWidgets.QVBoxLayout):
-            vbox.setSpacing(2)
-        for spin in box.findChildren(QtWidgets.QAbstractSpinBox):
-            suffix = getattr(spin, "suffix", lambda: "")()
-            if isinstance(spin, QtWidgets.QDoubleSpinBox):
-                text = f"{spin.maximum():.{spin.decimals()}f}{suffix}"
-            else:
-                text = f"{spin.maximum()}{suffix}"
-            width = spin.fontMetrics().horizontalAdvance(text) + 30
-            spin.setFixedSize(min(max(width, 50), 110), 22)
+    def page_of(self, widget):
+        """The index of the page `widget` sits on, or -1."""
+        for i, page in enumerate(self.pages):
+            if page.isAncestorOf(widget):
+                return i
+        return -1
 
-    @staticmethod
-    def _flatten_box(box, vertical=True):
-        """Rebuild one settings group box as a *new* compact box whose
-        layout is a narrow grid: every label/field pair gets its own row,
-        `label | field` (the top-to-bottom column that makes each box a
-        slim ~130-260px tile instead of a wide paired strip). Full-line rows
-        (the 2x2 margin grid, the report folder row, the field-only status
-        lines) span the whole width, and a row with a label keeps it in the
-        left label column.
-
-        Widgets are the same objects, only reparented -- every
-        `self.<attr>` reference the panel holds keeps working. Hidden rows
-        (sheet width/height, K-factor/curve tolerance, and the GA/cost/report
-        mirrors the native ribbon hides) are appended hidden at the end. The
-        old box is abandoned (Qt refuses to install a second layout on a
-        widget), so add_settings_tab() splices the new box back into
-        NestingPanel.settings_boxes."""
-        title = box.title()
-        old = box.layout()
-        rows = []
-
-        def drain_form(form):
-            while form.rowCount() > 0:
-                row = form.takeRow(0)
-                label = row.labelItem.widget() if row.labelItem is not None else None
-                field = None
-                if row.fieldItem is not None:
-                    field = row.fieldItem.widget()
-                    if field is None:
-                        field = row.fieldItem.layout()
-                yield label, field
-
-        def drain(items):
-            while items.count() > 0:
-                item = items.takeAt(0)
-                wid = item.widget()
-                lay = item.layout()
-                if isinstance(lay, QtWidgets.QFormLayout):
-                    yield from drain_form(lay)
-                elif wid is not None:
-                    yield None, wid
-                elif lay is not None:
-                    yield None, lay
-
-        if isinstance(old, QtWidgets.QFormLayout):
-            rows = list(drain_form(old))
-        else:
-            rows = list(drain(old))
-
-        kept = []
-        hidden = []  # rows hidden for the ribbon, but widgets are still
-                     # referenced by the panel (the GA/cost/report mirrors,
-                     # sheet width/height, k-factor, tolerance) -- they must
-                     # stay parented and alive, just invisible; QHide
-                     # children in a layout take no space.
-        for label, field in rows:
-            if isinstance(field, QtWidgets.QWidget) and not field.isVisibleTo(box):
-                hidden.append((label, field))
-            elif label is not None and not label.isVisibleTo(box):
-                hidden.append((label, field))
-            else:
-                kept.append((label, field))
-
-        def is_wide(label, field):
-            return isinstance(field, QtWidgets.QLayout) or (
-                label is None and isinstance(field, QtWidgets.QLabel)
-            )
-
-        new_box = QtWidgets.QGroupBox(title)
-        grid = QtWidgets.QGridLayout(new_box)
-        grid.setContentsMargins(5, 3, 5, 4)
-        grid.setHorizontalSpacing(4)
-        grid.setVerticalSpacing(1)
-
-        def add_field(field, row, col, span=1):
-            if isinstance(field, QtWidgets.QLayout):
-                grid.addLayout(field, row, col, 1, span)
-            else:
-                grid.addWidget(field, row, col, 1, span)
-
-        row = -1
-        for label, field in kept:
-            if is_wide(label, field):
-                row += 1
-                if label is not None:
-                    grid.addWidget(label, row, 0)
-                    grid.setAlignment(label, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-                    add_field(field, row, 1, span=3)
-                else:
-                    add_field(field, row, 0, span=4)
-                continue
-            row += 1
-            if label is not None:
-                grid.addWidget(label, row, 0)
-                grid.setAlignment(label, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            add_field(field, row, 1)
-
-        grid.setColumnStretch(0, 0)
-        grid.setColumnStretch(1, 1)
-
-        # Hidden rows: reparent (alive) but invisible -- appended at the
-        # end, where they collapse to zero height because they're QHidden.
-        for label, field in hidden:
-            row += 1
-            if label is not None:
-                grid.addWidget(label, row, 0, 1, 2)
-                label.hide()
-            add_field(field, row, 0, span=2)
-            if isinstance(field, QtWidgets.QWidget):
-                field.hide()
-        return new_box
-
-    def add_settings_tab(self, title, boxes):
-        """Fold one former sub-tab's settings group boxes into the flow:
-        each box is compacted and flattened into a narrow single-column
-        tile (see _compact_settings_box/_flatten_box), then grouped in one
-        section -- a short caption above the boxes. The flow places the
-        sections side by side and wraps them onto new rows when the window
-        narrows, so they always fit without any horizontal scrolling."""
-        rebuilt = []
-        for box in boxes:
-            self._compact_settings_box(box)
-            rebuilt.append(self._flatten_box(box, vertical=True))
-        boxes[:] = rebuilt
-
-        section = QtWidgets.QWidget(self._flow_container)
-        slay = QtWidgets.QVBoxLayout(section)
-        slay.setContentsMargins(0, 0, 0, 0)
-        slay.setSpacing(2)
-        caption = QtWidgets.QLabel(title, section)
-        caption.setObjectName("RibbonSectionCaption")
-        caption.setStyleSheet("font-weight: 600; padding-left: 1px;")
-        slay.addWidget(caption)
-        boxes_lay = QtWidgets.QHBoxLayout()
-        boxes_lay.setSpacing(4)
-        for box in rebuilt:
-            # Keep each box top-aligned in the section so a tall neighbor
-            # doesn't stretch every short box into empty space.
-            box.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
-            boxes_lay.addWidget(box, 1)
-        slay.addLayout(boxes_lay)
-        self._flow.addWidget(section)
+    def refresh_visibility(self):
+        for page in self.pages:
+            page.refresh_visibility()
+        for scroll in self.findChildren(_PageScroll):
+            scroll._fit_height()
 
     def set_theme(self, dark):
         for btn in self.findChildren(RibbonButton):

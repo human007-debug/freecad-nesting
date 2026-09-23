@@ -111,7 +111,8 @@ class FilePartSource:
             while name in self._extracted or name in extracted:
                 name = f"{original}-{suffix}"
                 suffix += 1
-            extracted[name] = {"outer": p["outer"], "holes": p["holes"], "thickness": None, "method": "dxf"}
+            extracted[name] = {"outer": p["outer"], "holes": p["holes"], "thickness": None, "method": "dxf",
+                                "quantity": p.get("quantity", 1)}
         return extracted, warnings
 
     def _scan_json(self, path):

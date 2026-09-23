@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="160" height="160">
+  <!-- AlphaNest's mark: a geometric lowercase alpha, one open bowl and one
+       leg, drawn as strokes with round caps so it holds together down to a
+       16px favicon. Color is the app's accent (native_app/theme.py). -->
+  <g fill="none" stroke="#FC4269" stroke-width="15" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 94 58 A 38 36 0 1 0 94 114"/>
+    <path d="M 97 52 C 89 74, 91 103, 123 129"/>
+  </g>
+</svg>

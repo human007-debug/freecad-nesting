@@ -41,10 +41,18 @@ one level; a block that itself references another block (nested blocks)
 is not recursively exploded -- rare in practice for flat nesting exports,
 which are usually already just flat geometry.
 
-MATERIAL, THICKNESS, QUANTITY: none of these exist in a DXF at all -- it's
-a 2D drawing with no notion of the sheet it'll be cut from. All three are
-CLI overrides only (`material:<name>=<value>` etc., matching
-freecad_extract.py's convention), keyed by the detected part name.
+MATERIAL, THICKNESS: neither exists in a DXF at all -- it's a 2D drawing
+with no notion of the sheet it'll be cut from. Both are CLI overrides only
+(`material:<name>=<value>` etc., matching freecad_extract.py's
+convention), keyed by the detected part name.
+
+QUANTITY: a DXF has no explicit quantity field either, but an assembly's
+flat-pattern export commonly draws the same part's outline several times
+(once per placement) -- `merge_duplicate_parts()` collapses those repeats
+by a placement-invariant shape signature (area/perimeter/hole areas, same
+idea as freecad_extract.py's `merge_duplicate_instances()`) into one part
+at quantity = the repeat count, before naming ever runs. A `--qty`
+override still wins over the inferred count.
 
 DWG: not read directly -- there's no reasonable pure-Python way to parse
 Autodesk's proprietary binary format. Convert DWG to DXF first (the free
@@ -61,7 +69,7 @@ import sys
 import ezdxf
 import ezdxf.path
 
-from geometry import point_in_polygon, polygon_area, polygon_bbox
+from geometry import point_in_polygon, polygon_area, polygon_bbox, polygon_perimeter
 
 
 GEOMETRY_TYPES = {
@@ -264,11 +272,48 @@ def _root_of(parents, i):
     return i
 
 
+def _shape_signature(part, ndigits=2):
+    """Placement-invariant fingerprint for spotting repeated instances of
+    the same physical part drawn several times in one DXF (e.g. a bracket's
+    flat pattern repeated once per rib in an assembly export) -- area,
+    perimeter, and sorted hole areas don't change with where the loop sits
+    in the drawing, unlike its raw points or bounding box. Mirrors
+    freecad_extract.py's merge_duplicate_instances()/`_shape_signature`."""
+    area = round(polygon_area(part["outer"]), ndigits)
+    perimeter = round(polygon_perimeter(part["outer"]), ndigits)
+    hole_areas = tuple(sorted(round(polygon_area(h), ndigits) for h in part["holes"]))
+    return (area, perimeter, len(part["holes"]), hole_areas)
+
+
+def merge_duplicate_parts(parts):
+    """Collapses parts sharing a `_shape_signature` into one entry each,
+    with `quantity` = the group's instance count, instead of every repeated
+    instance becoming its own part at quantity 1 -- see module docstring
+    and `_shape_signature`. A group of one is returned unchanged (quantity
+    1), so this is a no-op for a drawing with no repeated parts. Keeps the
+    first-seen instance's outer/holes; unions the merged instances' layers
+    (used for naming -- see main())."""
+    groups = {}
+    order = []
+    for part in parts:
+        sig = _shape_signature(part)
+        if sig not in groups:
+            merged = dict(part)
+            merged["quantity"] = 1
+            groups[sig] = merged
+            order.append(sig)
+        else:
+            groups[sig]["quantity"] += 1
+            groups[sig]["layers"] = groups[sig]["layers"] | part["layers"]
+    return [groups[sig] for sig in order]
+
+
 def extract_parts(path, tol=0.25, chain_tol=0.05):
     doc = ezdxf.readfile(path)
     msp = doc.modelspace()
     loops, warnings = extract_loops(doc, msp, tol, chain_tol)
     parts = group_into_parts(loops)
+    parts = merge_duplicate_parts(parts)
     return parts, warnings
 
 
@@ -335,12 +380,13 @@ def main(argv=None):
                 "source_file": os.path.basename(path),
                 "points": p["outer"],
                 "holes": p["holes"],
-                "quantity": qty_overrides.get(name, 1),
+                "quantity": qty_overrides.get(name, p.get("quantity", 1)),
                 "material": material_overrides.get(name),
                 "thickness": thickness_overrides.get(name),
                 "method": "dxf",
             })
-            print(f"[ok] {name}: {len(p['outer'])} outer pts, {len(p['holes'])} hole(s)")
+            qty_note = f", merged from {p['quantity']} identical instances" if p.get("quantity", 1) > 1 else ""
+            print(f"[ok] {name}: {len(p['outer'])} outer pts, {len(p['holes'])} hole(s){qty_note}")
 
     with open(args.output, "w") as f:
         json.dump({"parts": all_parts}, f, indent=2)

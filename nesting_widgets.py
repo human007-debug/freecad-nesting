@@ -39,6 +39,8 @@ import csv
 import hashlib
 import datetime
 import json
+import math
+import threading
 import os
 import random
 import time
@@ -56,15 +58,159 @@ import dxf_writer
 import inventory as inv
 import microjoints as mj
 import commonline
+import cutting_defaults
 import part_colors
 import remnant as rem
 
 
-SHEET_FILL = QtGui.QColor("#3d6690")
-SHEET_STROKE = QtGui.QColor("#223a52")
+# ---------------------------------------------------------- sheet colors
+#
+# The sheet is MATERIAL, so it is painted as a neutral plate -- the parts
+# are the only colored things on it. (It used to be filled steel blue,
+# which fought every part color on top of it and stayed bright blue in
+# dark mode.) These defaults are the light-theme values; the native app
+# pushes its active theme in through `set_sheet_palette()` so the canvas
+# follows light/dark with the rest of the window, while the FreeCAD
+# workbench -- which has no theme of its own -- keeps them as they are.
+WORKSPACE_FILL = QtGui.QColor("#F4F5F7")   # the surface the plate lies on
+SHEET_FILL = QtGui.QColor("#EFF1F4")
+SHEET_STROKE = QtGui.QColor("#B7BFC9")
+SHEET_GRID = QtGui.QColor("#DCE0E6")
+SHEET_SHADOW = QtGui.QColor(0, 0, 0, 26)
+MARKER_COLOR = QtGui.QColor("#2B2F36")   # microjoint tab markers, drawn ON the sheet
+HINT_COLOR = QtGui.QColor("#949BA4")     # the empty-canvas placeholder line
 COMMON_EDGE_COLOR = QtGui.QColor("#ff4fa0")
 
-_MAX_LAYOUT_CANDIDATES = 8
+# The CUTTING canvas: a host can give the live sheet view (and its Layout
+# Results thumbnails) a palette of its own, independent of the window theme
+# -- CAM nesting tools draw the sheet dark in both light and dark UIs, so
+# colored parts stand out on it the way they do on a machine's own screen.
+# Previews that don't opt in (`use_canvas_palette`), e.g. the ones rendered
+# into the HTML report, keep the theme colors above. None = not set: every
+# preview uses the theme colors. See set_canvas_palette().
+_CANVAS_PALETTE = None
+
+# Ruler band thickness (px) along the top and left edges, when shown.
+_RULER_PX = 22
+# Candidate ruler tick spacings in mm; the smallest one that leaves at
+# least _RULER_MIN_LABEL_PX between labelled ticks wins.
+_RULER_STEPS_MM = (1, 2, 5, 10, 20, 50, 100, 200, 250, 500, 1000, 2000, 5000)
+_RULER_MIN_LABEL_PX = 64.0
+
+# One 100 mm square of the preview's faint grid, in screen px, below which
+# the grid is skipped entirely: at a small zoom the lines would be closer
+# together than they are thin, and a solid haze is worse than no grid.
+_GRID_STEP_MM = 100.0
+_GRID_MIN_PX = 9.0
+# The live canvas's finest grid square (see SheetPreview._paint_workspace_grid).
+_GRID_FINE_MM = 10.0
+
+# Zoom range, as a multiple of the fit-to-screen scale. High enough to
+# read a 1 mm gap on a 3 m plate -- what the Measure tool needs.
+_ZOOM_MIN = 0.5
+_ZOOM_MAX = 100.0
+
+
+# The panel names a handful of its labels so a host application's own
+# stylesheet can style them (the native app's theme.py does exactly that).
+# Inside FreeCAD there is no such stylesheet, so the panel falls back to
+# this minimal one -- enough that a caption still reads as a caption.
+FALLBACK_QSS = """
+QLabel#JobReadinessTitle { font-size: 15px; font-weight: 600; }
+QLabel#JobReadinessDetail, QLabel#SheetPosReadout, QLabel#CoordReadout { color: #6b7179; }
+QLabel#SheetPosReadout { font-weight: 600; }
+QLabel#FieldHint, QLabel#SectionCaption { color: #8a8f98; font-size: 11px; }
+QLabel#SectionCaption { font-weight: 700; }
+QPlainTextEdit#ConsoleLog { font-family: monospace; font-size: 12px; }
+QPushButton#RowDelete { padding: 0; border: none; background: transparent; }
+QPushButton#NavButton { padding: 2px 0; font-size: 15px; }
+"""
+
+
+def untinted_icon(pixmap):
+    """A QIcon that looks the SAME when its row is selected.
+
+    Qt renders an item's icon in QIcon.Selected mode on a selected row,
+    and, with only a Normal pixmap to work from, generates that variant by
+    washing it in the Qt PALETTE's highlight color -- a stock blue, since
+    this app's theme is pure QSS and never touches the palette. A selected
+    sheet thumbnail therefore came back tinted blue while the same sheet
+    in the preview beside it was grey. Registering one pixmap for every
+    mode leaves Qt nothing to invent."""
+    icon = QtGui.QIcon()
+    for mode in (QtGui.QIcon.Normal, QtGui.QIcon.Selected, QtGui.QIcon.Active):
+        icon.addPixmap(pixmap, mode)
+    return icon
+
+
+def set_sheet_palette(tokens):
+    """Re-color the sheet preview from a `native_app.theme` palette dict.
+    Unknown/missing keys keep their current value, so a partial palette (or
+    a future theme that doesn't define one of these) degrades quietly."""
+    global WORKSPACE_FILL, SHEET_FILL, SHEET_STROKE, SHEET_GRID
+    global MARKER_COLOR, HINT_COLOR, SHEET_SHADOW
+    WORKSPACE_FILL = QtGui.QColor(tokens.get("bg", WORKSPACE_FILL))
+    SHEET_FILL = QtGui.QColor(tokens.get("sheet", SHEET_FILL))
+    SHEET_STROKE = QtGui.QColor(tokens.get("sheet_edge", SHEET_STROKE))
+    SHEET_GRID = QtGui.QColor(tokens.get("grid", SHEET_GRID))
+    MARKER_COLOR = QtGui.QColor(tokens.get("ink", MARKER_COLOR))
+    HINT_COLOR = QtGui.QColor(tokens.get("text_faint", HINT_COLOR))
+    # A black shadow all but disappears on a dark workspace, so a dark
+    # theme gets a deeper one to buy back the same amount of lift.
+    canvas = QtGui.QColor(tokens.get("canvas", "#ffffff"))
+    SHEET_SHADOW = QtGui.QColor(0, 0, 0, 64 if canvas.lightness() < 128 else 26)
+
+
+def set_canvas_palette(colors):
+    """Give opted-in previews (`SheetPreview.use_canvas_palette`) their own
+    colors: a dict with any of workspace, sheet, sheet_edge, grid, marker,
+    hint, ruler_bg, ruler_ink, ruler_tick, caption (color strings). Pass
+    None to go back to the theme colors.
+
+    A palette that also names `part` switches opted-in previews to CAD
+    drawing (see SheetPreview._cad_style): each part shaded in its own
+    color (see paintEvent), no plate shadow, and -- on the ruled live canvas -- a
+    LibreCAD dot grid (`grid`) with a dashed 10x `meta_grid`, a red
+    `origin` marker and the Measure tool drawn in `measure`."""
+    global _CANVAS_PALETTE
+    _CANVAS_PALETTE = None if colors is None else {k: QtGui.QColor(v) for k, v in colors.items()}
+
+
+def _preview_colors(use_canvas):
+    """The colors one preview paints with: the canvas palette when it opted
+    in and one is set, filled out with the theme colors for anything the
+    palette leaves out."""
+    colors = {
+        "workspace": WORKSPACE_FILL, "sheet": SHEET_FILL, "sheet_edge": SHEET_STROKE,
+        "grid": SHEET_GRID, "shadow": SHEET_SHADOW, "marker": MARKER_COLOR, "hint": HINT_COLOR,
+        "ruler_bg": WORKSPACE_FILL, "ruler_ink": HINT_COLOR, "ruler_tick": SHEET_STROKE,
+        "caption": MARKER_COLOR, "meta_grid": SHEET_GRID, "origin": COMMON_EDGE_COLOR,
+        "measure": COMMON_EDGE_COLOR,
+    }
+    if use_canvas and _CANVAS_PALETTE:
+        colors.update(_CANVAS_PALETTE)
+        if "shadow" not in _CANVAS_PALETTE:
+            dark = colors["workspace"].lightness() < 128
+            colors["shadow"] = QtGui.QColor(0, 0, 0, 90 if dark else 26)
+    return colors
+
+
+def _measurement(start, end):
+    """Distance, signed dX/dY (sheet mm) and direction (degrees counter-
+    clockwise from +X, 0-360) from `start` to `end`."""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    return {"distance": math.hypot(dx, dy), "dx": dx, "dy": dy,
+            "angle": math.degrees(math.atan2(dy, dx)) % 360.0,
+            "start": tuple(start), "end": tuple(end)}
+
+
+def _ruler_step(scale):
+    """The tick spacing (mm) for a ruler drawn at `scale` px per mm."""
+    for step in _RULER_STEPS_MM:
+        if step * scale >= _RULER_MIN_LABEL_PX:
+            return step
+    return _RULER_STEPS_MM[-1]
+
 
 # Display-only -- Price/kg, Scrap price, and every computed financial figure
 # are all just plain floats underneath (no currency-aware math anywhere);
@@ -82,8 +228,15 @@ class SheetPreview(QtWidgets.QWidget):
     NestingPanel's part_selector/_apply_manual_edit)."""
 
     clicked = QtCore.Signal(int)
-    coords = QtCore.Signal(object)  # (x, y) in sheet mm while the mouse moves, or None when it leaves
+    # (x, y) in mm along the rulers' axes (see _display_xy) while the mouse
+    # is over the sheet, or None when it leaves.
+    coords = QtCore.Signal(object)
     zoom_changed = QtCore.Signal(float)  # new zoom factor, from the mouse wheel
+    # Measure tool: a finished two-point measurement as a dict (distance,
+    # dx, dy, angle, start, end -- mm/degrees along the rulers' axes), or
+    # None when it is cleared.
+    measured = QtCore.Signal(object)
+    measure_mode_changed = QtCore.Signal(bool)  # e.g. Esc leaving Measure on its own
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -95,13 +248,33 @@ class SheetPreview(QtWidgets.QWidget):
         self._scale = 0.0
         self._off_x = 0.0
         self._off_y = 0.0
+        self._rotated = False
         # 1.0 = sheet fits the widget exactly (the popular case); anything
         # above magnifies the fit scale, cropping at the widget edge while
         # the sheet stays centered. The whole paint/hit-test/chord-display
         # math already runs through self._scale, so only this factor and the
         # centered offsets have to change -- no separate panned view needed.
         self._zoom = 1.0
+        self._pan = QtCore.QPointF()   # view shift in px, see _view()
+        self._pan_from = None          # (mouse pos, pan) while middle-dragging
+        self._hint = ""
+        self._caption = ""
+        # Opt-ins a host sets on its own live view: the cutting-canvas
+        # palette (see set_canvas_palette) and mm rulers along the top and
+        # left edges. Off by default, so thumbnails, report images and the
+        # FreeCAD workbench draw exactly as before.
+        self.use_canvas_palette = False
+        self.show_rulers = False
+        # Measure tool (LibreCAD's Info > Distance point-to-point): first
+        # click sets the start, second click fixes the end, a third starts
+        # over. Points are in sheet mm and snap to part/sheet corners, then
+        # to the nearest contour edge -- see _measure_snap().
+        self.measure_mode = False
+        self._measure_start = None
+        self._measure_end = None
+        self._measure_cursor = None   # (x, y, snap kind) under the mouse
         self.setMouseTracking(True)
+        self.setFocusPolicy(QtCore.Qt.ClickFocus)   # so Esc reaches keyPressEvent
         # Kept small on purpose (not 320x320): the sheet preview is the
         # largest single contributor to the whole window's layout minimum
         # size. A big minimum here makes the window open at nearly full
@@ -116,69 +289,231 @@ class SheetPreview(QtWidgets.QWidget):
         self.setMinimumSize(130, 130)
 
     def set_sheet(self, w, h, placed_parts, microjoint_cfg=None, common_line_cfg=None):
-        self.sheet_w = max(float(w), 1e-6)
-        self.sheet_h = max(float(h), 1e-6)
+        w, h = max(float(w), 1e-6), max(float(h), 1e-6)
+        if (w, h) != (self.sheet_w, self.sheet_h) and self._measure_start is not None:
+            # A different plate: the measured points meant something on the
+            # old one only.
+            self._clear_measurement()
+        self.sheet_w = w
+        self.sheet_h = h
         self.placed_parts = placed_parts
         self.microjoint_cfg = microjoint_cfg
         self.common_line_cfg = common_line_cfg
         self.update()
 
-    def set_zoom(self, factor):
-        self._zoom = max(0.5, min(4.0, float(factor)))
+    def set_hint(self, text):
+        """An empty-sheet placeholder, drawn centered over the preview while
+        it has nothing to show. The host clears it (empty string) the moment
+        real results arrive -- the canvas should speak only when it has
+        nothing better to show."""
+        self._hint = text
         self.update()
 
-    def zoom_in_step(self, step):
-        new_zoom = round((self._zoom + step) * 10) / 10
-        self._zoom = max(0.5, min(4.0, new_zoom))
-        self.zoom_changed.emit(self._zoom)
+    def set_caption(self, text):
+        """A label pinned to the canvas's top-right corner -- the sheet's
+        material/thickness and size, the way LaserNest and Lantek name the
+        plate on the canvas itself. Empty string hides it."""
+        self._caption = text
         self.update()
+
+    def _view(self, zoom=None, pan=None):
+        """The screen transform for `zoom`/`pan` (default: the current
+        ones): (ruler, margin, scale, off_x, off_y, rotated, disp_w,
+        disp_h), or None when the widget is too small to draw in.
+
+        The plate floats in the workspace rather than filling it to the
+        pixel -- the padding is what makes it read as an object on a
+        surface (and leaves room for its shadow). Proportional, so a 96px
+        thumbnail doesn't spend a third of itself on margin.
+
+        Display-only rotation: a sheet taller than it is wide (the common
+        case -- e.g. a 1220x2440mm steel sheet) renders sideways instead,
+        its long edge horizontal, so it uses the window's own long
+        (horizontal) dimension instead of being squeezed into a tall,
+        narrow column. Pure screen-space transform: self.sheet_w/sheet_h,
+        every PlacedPart's points, and everything downstream (DXF export,
+        nesting math) stay in the original, un-rotated coordinate system --
+        only to_screen() and its inverse (_to_sheet(), used by the mouse
+        handlers below) know this is happening.
+
+        Zoom magnifies the fit scale about the widget's center; `pan` (px)
+        then shifts the view, which is how the wheel zooms at the cursor
+        and a middle-drag moves around, the way LibreCAD's view does."""
+        zoom = self._zoom if zoom is None else zoom
+        pan = self._pan if pan is None else pan
+        ruler = _RULER_PX if self.show_rulers else 0
+        margin = max(4, min(16, int(min(self.width(), self.height()) * 0.05)))
+        if self.show_rulers:
+            margin = max(margin, 24)   # room for the caption and the rulers' end labels
+        avail_w = self.width() - ruler - 2 * margin
+        avail_h = self.height() - ruler - 2 * margin
+        if avail_w <= 0 or avail_h <= 0:
+            return None
+        rotated = self.sheet_h > self.sheet_w
+        disp_w = self.sheet_h if rotated else self.sheet_w
+        disp_h = self.sheet_w if rotated else self.sheet_h
+        scale = min(avail_w / disp_w, avail_h / disp_h) * zoom
+        off_x = ruler + margin + (avail_w - disp_w * scale) / 2 + pan.x()
+        off_y = ruler + margin + (avail_h - disp_h * scale) / 2 + pan.y()
+        return ruler, margin, scale, off_x, off_y, rotated, disp_w, disp_h
+
+    def _zoom_at(self, factor, anchor=None):
+        """Zoom to `factor`, keeping the sheet point under `anchor` (a
+        widget point; default the widget's center) where it is on screen.
+        Zooming back to fit (1x or less) also re-centers the sheet."""
+        factor = max(_ZOOM_MIN, min(_ZOOM_MAX, float(factor)))
+        if abs(factor - 1.0) < 0.01:
+            factor = 1.0   # zooming in and back out lands on fit exactly, not 0.9999
+        if factor <= 1.0:
+            self._zoom, self._pan = factor, QtCore.QPointF()
+            self.update()
+            return
+        if anchor is None:
+            anchor = QtCore.QPointF(self.width() / 2, self.height() / 2)
+        view = self._view()
+        new_view = self._view(zoom=factor, pan=QtCore.QPointF())
+        if view is None or new_view is None:
+            self._zoom = factor
+            self.update()
+            return
+        # Screen offset is linear in scale about the anchor: keep
+        # (anchor - off) / scale, i.e. the same sheet point under it.
+        _r, _m, scale, off_x, off_y = view[:5]
+        _r, _m, new_scale, base_x, base_y = new_view[:5]
+        k = new_scale / scale
+        new_off_x = anchor.x() - (anchor.x() - off_x) * k
+        new_off_y = anchor.y() - (anchor.y() - off_y) * k
+        self._zoom = factor
+        self._pan = QtCore.QPointF(new_off_x - base_x, new_off_y - base_y)
+        self.update()
+
+    def set_zoom(self, factor):
+        # The zoom spin shows two decimals, so its echo of a zoom_changed
+        # is a rounded copy of the zoom already in effect -- not a request
+        # to re-zoom about the center.
+        if abs(float(factor) - self._zoom) < 0.006:
+            return
+        self._zoom_at(factor)
+
+    def zoom_in_step(self, step, anchor=None):
+        """Zoom in (step > 0) or out by a fraction of the current zoom --
+        multiplicative, so each step feels the same at 1x and at 50x."""
+        factor = self._zoom * (1 + step) if step > 0 else self._zoom / (1 - step)
+        self._zoom_at(factor, anchor)
+        self.zoom_changed.emit(self._zoom)
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         if delta == 0:
             return
-        self.zoom_in_step(0.1 if delta > 0 else -0.1)
+        pos = event.position() if hasattr(event, "position") else QtCore.QPointF(event.pos())
+        self.zoom_in_step(0.25 if delta > 0 else -0.25, anchor=pos)
 
     def paintEvent(self, _event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        # The workspace is painted here rather than left to the stylesheet:
+        # a plain QWidget doesn't draw a QSS background at all, and this
+        # class is also rendered OFF-SCREEN for the Layout Results
+        # thumbnails, where there is no window behind it to show through --
+        # those came out on Qt's default blue-grey in light mode and on
+        # black in dark mode.
+        colors = _preview_colors(self.use_canvas_palette)
+        painter.fillRect(self.rect(), colors["workspace"])
 
-        margin = 6
-        avail_w = self.width() - 2 * margin
-        avail_h = self.height() - 2 * margin
-        if avail_w <= 0 or avail_h <= 0:
+        view = self._view()
+        if view is None:
             return
-        scale = min(avail_w / self.sheet_w, avail_h / self.sheet_h)
-        # Centered magnification: at zoom>1 the sheet is drawn larger than
-        # the widget and clipped at the edges, keeping the sheet's center in
-        # view. Everything downstream (hit-testing, chord readout) is driven
-        # by the stored transform, so this stays exact.
-        scale *= self._zoom
-        off_x = margin + (avail_w - self.sheet_w * scale) / 2
-        off_y = margin + (avail_h - self.sheet_h * scale) / 2
+        ruler, margin, scale, off_x, off_y, rotated, disp_w, disp_h = view
         # Stored so mousePressEvent() can invert exactly this transform for
         # click hit-testing, without duplicating the margin/scale math.
-        self._scale, self._off_x, self._off_y = scale, off_x, off_y
+        self._scale, self._off_x, self._off_y, self._rotated = scale, off_x, off_y, rotated
 
         def to_screen(x, y):
-            # sheet coords are Y-up; screen is Y-down.
+            # sheet coords are Y-up; screen is Y-down. When rotated, the
+            # sheet's height (its long edge) becomes the screen's horizontal
+            # axis and its width becomes the vertical one.
+            if rotated:
+                return QtCore.QPointF(off_x + y * scale, off_y + (self.sheet_w - x) * scale)
             return QtCore.QPointF(off_x + x * scale, off_y + (self.sheet_h - y) * scale)
 
-        painter.setPen(QtGui.QPen(SHEET_STROKE, 2))
-        painter.setBrush(SHEET_FILL)
-        painter.drawPolygon(QtGui.QPolygonF([
+        sheet_poly = QtGui.QPolygonF([
             to_screen(0, 0), to_screen(self.sheet_w, 0),
             to_screen(self.sheet_w, self.sheet_h), to_screen(0, self.sheet_h),
-        ]))
+        ])
+        # A soft drop shadow lifts the plate off the workspace -- the one
+        # depth cue in an otherwise flat UI, and the thing that makes the
+        # sheet read as a physical object rather than as a filled rectangle.
+        cad = self._cad_style()
+        painter.setPen(QtCore.Qt.NoPen)
+        for offset, alpha in (() if cad else ((3, 1.0), (6, 0.45))):
+            shadow = QtGui.QColor(colors["shadow"])
+            shadow.setAlpha(int(colors["shadow"].alpha() * alpha))
+            painter.setBrush(shadow)
+            painter.drawPolygon(sheet_poly.translated(0, offset))
+
+        painter.setPen(QtGui.QPen(colors["sheet_edge"], 1 if cad else 1.5))
+        painter.setBrush(colors["sheet"])
+        painter.drawPolygon(sheet_poly)
+
+        # Graph-paper grid: it gives the eye a scale for how big a part
+        # actually is, which a bare fill cannot. The live CAD canvas gets
+        # LibreCAD's grid over the whole workspace; CAD thumbnails get none
+        # (at that size it is only noise); theme-colored previews (report
+        # images) keep a coarse 100 mm grid clipped to the plate.
+        step_px = _GRID_STEP_MM * scale
+        if cad:
+            if self.show_rulers:
+                self._paint_workspace_grid(painter, colors, ruler, scale, off_x, off_y, disp_h)
+        elif step_px >= _GRID_MIN_PX:
+            painter.save()
+            painter.setClipRect(sheet_poly.boundingRect())
+            painter.setPen(QtGui.QPen(colors["grid"], 1))
+            x = _GRID_STEP_MM
+            while x < self.sheet_w:
+                painter.drawLine(to_screen(x, 0), to_screen(x, self.sheet_h))
+                x += _GRID_STEP_MM
+            y = _GRID_STEP_MM
+            while y < self.sheet_h:
+                painter.drawLine(to_screen(0, y), to_screen(self.sheet_w, y))
+                y += _GRID_STEP_MM
+            painter.restore()
+
+        if self._hint and not self.placed_parts:
+            # Human at-a-glance placeholder for the pre-run sheet: tell the
+            # user what this empty space is FOR instead of leaving a blank
+            # rectangle to guess at. Drawn over the sheet center, in the
+            # stable mid-gray both themes share, so it reads as guidance
+            # rather than as a part.
+            painter.save()
+            painter.setPen(colors["hint"])
+            font = painter.font()
+            font.setItalic(True)
+            painter.setFont(font)
+            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, self._hint)
+            painter.restore()
 
         for pp in self.placed_parts:
-            painter.setBrush(part_colors.color_for(pp.name))
-            if pp.mirrored:
-                dashed_pen = QtGui.QPen(part_colors.outline_for(pp.name), 1.5)
-                dashed_pen.setStyle(QtCore.Qt.DashLine)
-                painter.setPen(dashed_pen)
+            hatch = None
+            if cad:
+                # On the black CAD ground each part is shaded in its own
+                # color the way LaserNest shades a nest: a see-through fill
+                # (the grid and the contour stay readable through it), a
+                # diagonal hatch on top, and a crisp outline in the same hue.
+                base = part_colors.color_for(pp.name)
+                fill = QtGui.QColor(base)
+                fill.setAlpha(80)
+                painter.setBrush(fill)
+                hatch_color = QtGui.QColor(base)
+                hatch_color.setAlpha(150)
+                hatch = QtGui.QBrush(hatch_color, QtCore.Qt.BDiagPattern)
+                pen = QtGui.QPen(base.lighter(125), 1)
             else:
-                painter.setPen(QtGui.QPen(part_colors.outline_for(pp.name), 1.5))
+                painter.setBrush(part_colors.color_for(pp.name))
+                pen = QtGui.QPen(part_colors.outline_for(pp.name), 1.5)
+            if pp.mirrored:
+                pen.setStyle(QtCore.Qt.DashLine)
+            painter.setPen(pen)
             path = QtGui.QPainterPath()
             outer = QtGui.QPolygonF([to_screen(x, y) for x, y in pp.points])
             path.addPolygon(outer)
@@ -190,13 +525,19 @@ class SheetPreview(QtWidgets.QWidget):
                 hole_path.closeSubpath()
                 path = path.subtracted(hole_path)
             painter.drawPath(path)
+            if hatch is not None:
+                painter.save()
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.setBrush(hatch)
+                painter.drawPath(path)
+                painter.restore()
 
         if self.microjoint_cfg:
             # Not the real cut path -- just a marker at each tab gap's
             # midpoint, so tabs are visible in the preview before ever
             # exporting (the real gapped geometry is what write_dxf() emits).
-            painter.setPen(QtGui.QPen(QtGui.QColor("#ffffff"), 1))
-            painter.setBrush(QtGui.QColor("#ffffff"))
+            painter.setPen(QtGui.QPen(colors["marker"], 1))
+            painter.setBrush(colors["marker"])
             for pp in self.placed_parts:
                 segments = mj.add_tabs(pp.points, **self.microjoint_cfg)
                 if len(segments) < 2:
@@ -220,28 +561,347 @@ class SheetPreview(QtWidgets.QWidget):
                 for p1, p2 in merged_edges:
                     painter.drawLine(to_screen(*p1), to_screen(*p2))
                 painter.setPen(QtGui.QPen(COMMON_EDGE_COLOR))
-                painter.drawText(margin + 4, self.height() - margin - 4, "Common-edge cutting active")
+                painter.drawText(ruler + margin + 4, self.height() - margin - 4, "Common-edge cutting active")
+
+        if self._caption:
+            painter.save()
+            font = painter.font()
+            font.setPixelSize(15)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(colors["caption"])
+            painter.drawText(QtCore.QRectF(ruler, ruler + 4, self.width() - ruler - 12, 40),
+                             QtCore.Qt.AlignRight | QtCore.Qt.AlignTop, self._caption)
+            painter.restore()
+
+        if cad and self.show_rulers:
+            # LibreCAD's red origin cross, at the plate's (0, 0) corner.
+            o = to_screen(0, 0)
+            painter.setPen(QtGui.QPen(colors["origin"], 1))
+            painter.drawLine(o - QtCore.QPointF(20, 0), o + QtCore.QPointF(20, 0))
+            painter.drawLine(o - QtCore.QPointF(0, 20), o + QtCore.QPointF(0, 20))
+
+        if self.measure_mode or self._measure_start is not None:
+            self._paint_measurement(painter, colors, to_screen)
+
+        if self.show_rulers:
+            self._paint_rulers(painter, colors, ruler, scale, off_x, off_y, disp_w, disp_h)
+
+    def _cad_style(self):
+        """True when this preview draws like a CAD view (LibreCAD): it opted
+        into the canvas palette and that palette names a part line color."""
+        return bool(self.use_canvas_palette and _CANVAS_PALETTE and "part" in _CANVAS_PALETTE)
+
+    def _paint_measurement(self, painter, colors, to_screen):
+        """The Measure tool's overlay: the rubber-band (or fixed) line with
+        its end marks, the snap marker under the mouse, and a readout of
+        the distance, dX/dY and angle beside the line."""
+        color = colors["measure"]
+        painter.save()
+        painter.setBrush(QtCore.Qt.NoBrush)
+        start = self._measure_start
+        end = self._measure_end
+        if end is None and start is not None and self._measure_cursor is not None:
+            end = self._measure_cursor[:2]
+        if start is not None and end is not None:
+            a, b = to_screen(*start), to_screen(*end)
+            painter.setPen(QtGui.QPen(color, 1.5))
+            painter.drawLine(a, b)
+            for p in (a, b):
+                painter.drawLine(p - QtCore.QPointF(5, 5), p + QtCore.QPointF(5, 5))
+                painter.drawLine(p - QtCore.QPointF(5, -5), p + QtCore.QPointF(5, -5))
+            m = _measurement(self._display_xy(*start), self._display_xy(*end))
+            text = (f"{m['distance']:.2f} mm\n"
+                    f"ΔX {m['dx']:.2f}   ΔY {m['dy']:.2f}   {m['angle']:.1f}°")
+            font = painter.font()
+            font.setPixelSize(12)
+            painter.setFont(font)
+            box = painter.fontMetrics().boundingRect(QtCore.QRect(0, 0, 400, 100), 0, text)
+            box = QtCore.QRectF(box).adjusted(-6, -4, 6, 4)
+            mid = (a + b) / 2
+            box.moveTopLeft(mid + QtCore.QPointF(10, 10))
+            # Keep the readout on screen when the line runs to an edge.
+            if box.right() > self.width() - 4:
+                box.moveRight(mid.x() - 10)
+            if box.bottom() > self.height() - 4:
+                box.moveBottom(mid.y() - 10)
+            painter.setPen(QtGui.QPen(color, 1))
+            painter.setBrush(QtGui.QColor(0, 0, 0, 200))
+            painter.drawRect(box)
+            painter.drawText(box, QtCore.Qt.AlignCenter, text)
+            painter.setBrush(QtCore.Qt.NoBrush)
+        if self.measure_mode and self._measure_cursor is not None:
+            x, y, kind = self._measure_cursor
+            c = to_screen(x, y)
+            painter.setPen(QtGui.QPen(color, 1.5))
+            if kind == "vertex":      # snapped to a corner: a small square, like LibreCAD's endpoint snap
+                painter.drawRect(QtCore.QRectF(c.x() - 5, c.y() - 5, 10, 10))
+            elif kind == "edge":      # snapped onto a contour: a diamond
+                painter.drawPolygon(QtGui.QPolygonF([c + QtCore.QPointF(0, -6), c + QtCore.QPointF(6, 0),
+                                                     c + QtCore.QPointF(0, 6), c + QtCore.QPointF(-6, 0)]))
+        painter.restore()
+
+    # ---------------------------------------------------------- measure tool
+
+    def set_measure_mode(self, on):
+        on = bool(on)
+        if on == self.measure_mode:
+            return
+        self.measure_mode = on
+        self._clear_measurement()
+        if on:
+            self.setCursor(QtCore.Qt.CrossCursor)
+            self.setFocus()
+        else:
+            self.unsetCursor()
+        self.measure_mode_changed.emit(on)
+
+    def _clear_measurement(self):
+        had = self._measure_start is not None
+        self._measure_start = self._measure_end = None
+        self._measure_cursor = None
+        if had:
+            self.measured.emit(None)
+        self.update()
+
+    def _display_xy(self, x, y):
+        """Sheet mm -> the canvas's own axes, the ones its rulers measure:
+        on a sheet drawn sideways (see _view()) the horizontal ruler reads
+        the sheet's Y and the vertical one its X."""
+        return (y, x) if self._rotated else (x, y)
+
+    def _measure_result(self):
+        return _measurement(self._display_xy(*self._measure_start), self._display_xy(*self._measure_end))
+
+    def _to_screen(self, x, y):
+        """Sheet mm -> widget px, with the transform the last paint used."""
+        if self._rotated:
+            return self._off_x + y * self._scale, self._off_y + (self.sheet_w - x) * self._scale
+        return self._off_x + x * self._scale, self._off_y + (self.sheet_h - y) * self._scale
+
+    def _measure_snap(self, x, y):
+        """The point the Measure tool should use for sheet point (x, y):
+        the nearest part/sheet corner within 10 px, else the nearest point
+        on a part/sheet contour within 6 px, else (x, y) itself. Returns
+        (x, y, kind) with kind "vertex", "edge" or None."""
+        corners = [(0.0, 0.0), (self.sheet_w, 0.0), (self.sheet_w, self.sheet_h), (0.0, self.sheet_h)]
+        loops = [corners]
+        for pp in self.placed_parts:
+            loops.append(pp.points)
+            loops.extend(pp.holes)
+        vertex_tol = 10.0 / self._scale
+        best, best_d = None, vertex_tol
+        for loop in loops:
+            for vx, vy in loop:
+                d = math.hypot(vx - x, vy - y)
+                if d <= best_d:
+                    best, best_d = (vx, vy), d
+        if best is not None:
+            return best[0], best[1], "vertex"
+        edge_tol = 6.0 / self._scale
+        best_d = edge_tol
+        for loop in loops:
+            n = len(loop)
+            for i in range(n):
+                (ax, ay), (bx, by) = loop[i], loop[(i + 1) % n]
+                ex, ey = bx - ax, by - ay
+                length2 = ex * ex + ey * ey
+                t = 0.0 if length2 == 0 else max(0.0, min(1.0, ((x - ax) * ex + (y - ay) * ey) / length2))
+                px, py = ax + t * ex, ay + t * ey
+                d = math.hypot(px - x, py - y)
+                if d <= best_d:
+                    best, best_d = (px, py), d
+        if best is not None:
+            return best[0], best[1], "edge"
+        return x, y, None
+
+    def keyPressEvent(self, event):
+        if self.measure_mode and event.key() == QtCore.Qt.Key_Escape:
+            # Esc first drops a measurement in progress, then leaves the tool
+            # -- LibreCAD's two-step Esc.
+            if self._measure_start is not None:
+                self._clear_measurement()
+            else:
+                self.set_measure_mode(False)
+            return
+        super().keyPressEvent(event)
+
+    def _paint_workspace_grid(self, painter, colors, ruler, scale, off_x, off_y, disp_h):
+        """LibreCAD's grid across the whole canvas (not just the plate): a
+        dot every 10 mm plus a dashed "meta grid" line every 100 mm,
+        anchored at the plate's displayed bottom-left corner so both sit on
+        the rulers' ticks. When 10 mm dots would be closer than
+        _GRID_MIN_PX the whole grid steps up tenfold (100/1000 mm, and so
+        on), as LibreCAD's does -- zoom in to get the 10 mm grid back."""
+        step = _GRID_FINE_MM
+        while step * scale < _GRID_MIN_PX:
+            step *= 10.0
+        step_px = step * scale
+        left, top = float(ruler), float(ruler)
+        right, bottom = float(self.width()), float(self.height())
+        origin_y = off_y + disp_h * scale  # screen y of the displayed bottom edge
+        # Index of the first grid column/row on screen, counted from the
+        # origin, so every 10th one (the meta grid) is known exactly.
+        i0 = math.ceil((left - off_x) / step_px)
+        j0 = math.ceil((origin_y - bottom) / step_px)   # rows counted upward from the origin
+        xs = []
+        i = i0
+        while off_x + i * step_px <= right:
+            xs.append((i, off_x + i * step_px))
+            i += 1
+        ys = []
+        j = j0
+        while origin_y - j * step_px >= top:
+            ys.append((j, origin_y - j * step_px))
+            j += 1
+        painter.save()
+        painter.setClipRect(QtCore.QRectF(left, top, right - left, bottom - top))
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        meta_pen = QtGui.QPen(colors["meta_grid"], 1)
+        meta_pen.setDashPattern([3, 3])
+        painter.setPen(meta_pen)
+        for i, x in xs:
+            if i % 10 == 0:
+                painter.drawLine(QtCore.QPointF(x, top), QtCore.QPointF(x, bottom))
+        for j, y in ys:
+            if j % 10 == 0:
+                painter.drawLine(QtCore.QPointF(left, y), QtCore.QPointF(right, y))
+        painter.setPen(QtGui.QPen(colors["grid"], 1))
+        painter.drawPoints(QtGui.QPolygonF([QtCore.QPointF(x, y) for _i, x in xs for _j, y in ys]))
+        painter.restore()
+
+    def _paint_rulers(self, painter, colors, ruler, scale, off_x, off_y, disp_w, disp_h):
+        """mm rulers along the top and left edges, measuring the sheet as
+        it is DRAWN: the horizontal ruler runs along the displayed long edge
+        (so on a rotated portrait sheet it reads the sheet's Y), the
+        vertical one up from the displayed bottom-left corner -- matching
+        the grid and the X/Y readout."""
+        painter.save()
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(colors["ruler_bg"])
+        painter.drawRect(QtCore.QRectF(0, 0, self.width(), ruler))
+        painter.drawRect(QtCore.QRectF(0, 0, ruler, self.height()))
+        font = painter.font()
+        font.setPixelSize(10)
+        painter.setFont(font)
+        step = _ruler_step(scale)
+        minor = step / 5.0
+        tick_pen = QtGui.QPen(colors["ruler_tick"], 1)
+
+        # Horizontal: screen x = off_x + v * scale.
+        v = max(0.0, math.floor((ruler - off_x) / scale / minor) * minor)
+        while v <= disp_w + 1e-6:
+            x = off_x + v * scale
+            if x > self.width():
+                break
+            if x >= ruler:
+                major = abs(v / step - round(v / step)) < 1e-6
+                painter.setPen(tick_pen)
+                painter.drawLine(QtCore.QPointF(x, ruler), QtCore.QPointF(x, ruler - (9 if major else 4)))
+                if major:
+                    painter.setPen(colors["ruler_ink"])
+                    painter.drawText(QtCore.QPointF(x + 3, 11), f"{v:g}")
+            v += minor
+
+        # Vertical: screen y = off_y + (disp_h - u) * scale, u up from the
+        # displayed bottom edge. Labels are drawn rotated along the band.
+        u = max(0.0, math.floor((off_y + disp_h * scale - self.height()) / scale / minor) * minor)
+        while u <= disp_h + 1e-6:
+            y = off_y + (disp_h - u) * scale
+            if y < ruler:
+                break
+            if y <= self.height():
+                major = abs(u / step - round(u / step)) < 1e-6
+                painter.setPen(tick_pen)
+                painter.drawLine(QtCore.QPointF(ruler, y), QtCore.QPointF(ruler - (9 if major else 4), y))
+                if major:
+                    painter.save()
+                    painter.translate(11, y - 3)
+                    painter.rotate(-90)
+                    painter.setPen(colors["ruler_ink"])
+                    painter.drawText(QtCore.QPointF(0, 0), f"{u:g}")
+                    painter.restore()
+            u += minor
+
+        painter.setPen(QtGui.QPen(colors["ruler_tick"], 1))
+        painter.drawLine(QtCore.QPointF(ruler, ruler), QtCore.QPointF(self.width(), ruler))
+        painter.drawLine(QtCore.QPointF(ruler, ruler), QtCore.QPointF(ruler, self.height()))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(colors["ruler_bg"])
+        painter.drawRect(QtCore.QRectF(0, 0, ruler, ruler))
+        painter.restore()
+
+    def _to_sheet(self, px, py):
+        """Inverts to_screen()'s transform (including the display rotation)
+        so mouse handlers always work in real sheet coordinates."""
+        if self._rotated:
+            y = (px - self._off_x) / self._scale
+            x = self.sheet_w - (py - self._off_y) / self._scale
+        else:
+            x = (px - self._off_x) / self._scale
+            y = self.sheet_h - (py - self._off_y) / self._scale
+        return x, y
 
     def mouseMoveEvent(self, event):
         if self._scale <= 0:
             return
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-        x = (pos.x() - self._off_x) / self._scale
-        y = self.sheet_h - (pos.y() - self._off_y) / self._scale
+        if self._pan_from is not None:
+            start, pan = self._pan_from
+            self._pan = pan + QtCore.QPointF(pos - start)
+            self.update()
+        x, y = self._to_sheet(pos.x(), pos.y())
+        if self.measure_mode:
+            self._measure_cursor = self._measure_snap(x, y)
+            x, y = self._measure_cursor[:2]   # the readout shows the snapped point
+            self.update()
         if 0.0 - 1e-6 <= x <= self.sheet_w + 1e-6 and 0.0 - 1e-6 <= y <= self.sheet_h + 1e-6:
-            self.coords.emit((x, y))
+            self.coords.emit(self._display_xy(x, y))
         else:
             self.coords.emit(None)
 
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.MiddleButton and self._pan_from is not None:
+            self._pan_from = None
+            if self.measure_mode:
+                self.setCursor(QtCore.Qt.CrossCursor)
+            else:
+                self.unsetCursor()
+            return
+        super().mouseReleaseEvent(event)
+
     def leaveEvent(self, _event):
         self.coords.emit(None)
+        if self.measure_mode and self._measure_cursor is not None:
+            self._measure_cursor = None
+            self.update()
 
     def mousePressEvent(self, event):
         if self._scale <= 0:
             return
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-        x = (pos.x() - self._off_x) / self._scale
-        y = self.sheet_h - (pos.y() - self._off_y) / self._scale
+        if event.button() == QtCore.Qt.MiddleButton:
+            # Middle-drag pans, as in LibreCAD.
+            self._pan_from = (pos, QtCore.QPointF(self._pan))
+            self.setCursor(QtCore.Qt.ClosedHandCursor)
+            return
+        x, y = self._to_sheet(pos.x(), pos.y())
+        if self.measure_mode:
+            if event.button() == QtCore.Qt.RightButton:
+                # Right click = Esc, as in LibreCAD.
+                if self._measure_start is not None:
+                    self._clear_measurement()
+                else:
+                    self.set_measure_mode(False)
+                return
+            point = self._measure_snap(x, y)[:2]
+            if self._measure_start is None or self._measure_end is not None:
+                self._measure_start, self._measure_end = point, None
+            else:
+                self._measure_end = point
+                self.measured.emit(self._measure_result())
+            self.update()
+            return
         for i in range(len(self.placed_parts) - 1, -1, -1):
             if geometry.point_in_polygon((x, y), self.placed_parts[i].points):
                 self.clicked.emit(i)
@@ -284,6 +944,39 @@ class _PartsTable(QtWidgets.QTableWidget):
         menu.exec(self.viewport().mapToGlobal(pos))
 
 
+class _SearchRelay(QtCore.QObject):
+    """Carries a background search's live callbacks over to the GUI thread.
+
+    The search runs on a worker thread (see NestingPanel._optimize_ordering)
+    and may not touch a widget; its callbacks just emit these signals, and
+    the queued connections below run the real UI updates on the thread that
+    owns the widgets. `active` is cleared when the run ends, so an update
+    still queued behind the end of the run is dropped instead of painting a
+    stale candidate over the final layout."""
+
+    progress = QtCore.Signal(object)
+    placement = QtCore.Signal(object)
+    done = QtCore.Signal()
+
+    def __init__(self, on_progress, on_placement, parent=None):
+        super().__init__(parent)
+        self.active = True
+        self._on_progress = on_progress
+        self._on_placement = on_placement
+        self.progress.connect(self._deliver_progress, QtCore.Qt.QueuedConnection)
+        self.placement.connect(self._deliver_placement, QtCore.Qt.QueuedConnection)
+
+    @QtCore.Slot(object)
+    def _deliver_progress(self, args):
+        if self.active:
+            self._on_progress(*args)
+
+    @QtCore.Slot(object)
+    def _deliver_placement(self, args):
+        if self.active:
+            self._on_placement(*args)
+
+
 class NestingPanel(QtWidgets.QWidget):
     """Everything from settings down to the action buttons. See module
     docstring for the `part_source` contract this is built around.
@@ -314,6 +1007,8 @@ class NestingPanel(QtWidgets.QWidget):
                                          # readouts (the ribbon's Layout optimization / Estimate boxes) mirror it
     preflight_ready = QtCore.Signal(bool)  # fires whenever the parts-level preflight gate changes -- lets the
                                            # app disable Run Nesting / Commit / Export / Report until parts pass
+    sheet_shown = QtCore.Signal(int)       # fires after the preview shows a sheet (its index), or -1 when there are none -- e.g. for a host's status bar
+    job_path_changed = QtCore.Signal(object)  # fires when the job file this panel saves to changes (a path, or None) -- e.g. for a window title
     currency_changed = QtCore.Signal(str)  # fires whenever currency_code changes (set_currency(), or a job
                                             # load restoring one) -- e.g. for a Stock tab's currency picker to
                                             # stay in sync when the change came from somewhere else
@@ -352,7 +1047,6 @@ class NestingPanel(QtWidgets.QWidget):
         # StockPanel) and calls set_currency(); the FreeCAD workbench has
         # no stock-editing UI at all yet, so it stays at the default there.
         self.currency_code = DEFAULT_CURRENCY
-        self.layout_candidates = []  # last _MAX_CANDIDATES Run Nesting results, newest last
         self._stop_requested = False
         self._search_started_at = None
         self._search_timer = QtCore.QTimer(self)
@@ -364,6 +1058,10 @@ class NestingPanel(QtWidgets.QWidget):
         self._inventory_template = None  # List[StockSheet] as loaded from disk, never mutated
         self._inventory_path = None      # where to write back to on Commit
         self._last_run_parts = None      # parts used in the last run -- what Commit actually commits
+        self._last_run_cutting_params = None  # nesting-time params (part spacing/margins) as of that run --
+                                               # see _current_cutting_params(); the report reads this, not the
+                                               # live widgets, so a slider tweaked AFTER a run doesn't make the
+                                               # report lie about what actually produced the layout on screen.
         self._last_run_used_ga = False   # whether that run went through the GA (needs the same seed replayed on Commit)
         self._last_run_ga_kwargs = None  # ga_kwargs (incl. the seed used) to replay identically on Commit
         self._job_path = None            # where "Save Job" writes to once a job's been saved/opened once
@@ -391,7 +1089,19 @@ class NestingPanel(QtWidgets.QWidget):
             top_layout.addWidget(box)
 
     def _build_ui(self):
+        app = QtWidgets.QApplication.instance()
+        if app is not None and not app.styleSheet():
+            # No host theme (i.e. the FreeCAD workbench, not the native
+            # app): give the named labels their minimum manners. Skipped
+            # when a host HAS a stylesheet, so this can never fight it.
+            self.setStyleSheet(FALLBACK_QSS)
+
         root = QtWidgets.QVBoxLayout(self)
+        # The work area is inset from the window edge -- content that runs
+        # into the frame reads as unfinished, and the gutter is what makes
+        # the sheet preview look placed rather than wedged in.
+        root.setContentsMargins(14, 12, 14, 10)
+        root.setSpacing(8)
 
         # A compact, always-visible state summary keeps the next useful
         # action obvious without hiding any of the detailed controls below.
@@ -404,7 +1114,6 @@ class NestingPanel(QtWidgets.QWidget):
         readiness_layout.setSpacing(2)
         self.readiness_title = QtWidgets.QLabel("No parts loaded")
         self.readiness_title.setObjectName("JobReadinessTitle")
-        self.readiness_title.setStyleSheet("font-size: 15px; font-weight: 600;")
         self.readiness_detail = QtWidgets.QLabel("Add parts to begin. The layout will be checked before it can be exported.")
         self.readiness_detail.setObjectName("JobReadinessDetail")
         self.readiness_detail.setWordWrap(True)
@@ -550,6 +1259,40 @@ class NestingPanel(QtWidgets.QWidget):
         form.addRow(self.margin_apply_all)
         form.addRow("K-factor (bend allowance)", self.kfactor)
         form.addRow("Curve tolerance", self.tolerance)
+        self.recommend_cutting_btn = QtWidgets.QPushButton("Suggest cut settings")
+        self.recommend_cutting_btn.setToolTip(
+            "Fills part spacing, margins, and microjoint tab width/spacing using the Cutting tab's "
+            "\"Recommendation formula\" coefficients (published sheet-metal laser-cutting DFM defaults "
+            "unless you've edited them there) for the thickness(es) of the parts currently loaded -- a "
+            "starting point, not a substitute for your own machine's kerf-verified numbers. With more "
+            "than one thickness loaded, applies the thickest group's numbers (safe for thinner groups "
+            "too, just a little less tight)."
+        )
+        self.recommend_cutting_btn.clicked.connect(self._recommend_cutting_params)
+        form.addRow(self.recommend_cutting_btn)
+        if self.settings_in_ribbon:
+            # This is the one control in "Layout basics" that genuinely
+            # changes every nest (it's driven by whatever parts/thicknesses
+            # are loaded right now) -- pulled out of the box so the window
+            # can put it directly on the ribbon, while the rest of this box
+            # (part spacing, margins -- its usual OUTPUT, set-once-ish) moves
+            # into the Settings dialog. Same take-row-and-reparent-to-self
+            # dance as assembly_quantity above.
+            row_idx, _role = form.getWidgetPosition(self.recommend_cutting_btn)
+            if row_idx != -1:
+                result = form.takeRow(row_idx)
+                if result.labelItem is not None and result.labelItem.widget() is not None:
+                    result.labelItem.widget().hide()
+                self.recommend_cutting_btn.setParent(self)
+                self.recommend_cutting_btn.hide()
+        self.recommendation_settings_btn = QtWidgets.QPushButton("Recommendation formula settings...")
+        self.recommendation_settings_btn.setToolTip(
+            "Edit the multipliers/floors/ceilings the button above computes from, or reset them to the "
+            "published industry defaults. Opens in its own window since it's a lot of rarely-touched "
+            "fields to keep inline here."
+        )
+        self.recommendation_settings_btn.clicked.connect(self._open_recommendation_settings)
+        form.addRow(self.recommendation_settings_btn)
         # Sheet width/height are intentionally NOT shown: nesting always
         # sizes parts against real inventory stock now, so the sheet size
         # UI has nothing to control. The widgets still exist and keep their
@@ -607,7 +1350,7 @@ class NestingPanel(QtWidgets.QWidget):
         # ribbon boxes (and they read as "do A, then B" vertically).
         inv_buttons = QtWidgets.QVBoxLayout()
         inv_buttons.setSpacing(2)
-        load_inv_btn = QtWidgets.QPushButton("Load Inventory JSON...")
+        load_inv_btn = QtWidgets.QPushButton("Load Inventory...")
         load_inv_btn.clicked.connect(self._load_inventory)
         clear_inv_btn = QtWidgets.QPushButton("Clear")
         clear_inv_btn.clicked.connect(self._clear_inventory)
@@ -654,7 +1397,7 @@ class NestingPanel(QtWidgets.QWidget):
         )
         inv_box_layout.addWidget(self.joint_stock_optimization)
 
-        self.true_joint_stock_optimization = QtWidgets.QCheckBox("Search size combinations (slower)")
+        self.true_joint_stock_optimization = QtWidgets.QCheckBox("Mix stock sizes (slower)")
         self.true_joint_stock_optimization.setToolTip(
             "Closes the real gap the checkbox above still can't: hill-climbs over an explicit, ordered "
             "plan of specific stock sheets -- possibly mixed sizes -- for the group's WHOLE remaining "
@@ -667,6 +1410,15 @@ class NestingPanel(QtWidgets.QWidget):
         )
         self.true_joint_stock_optimization.toggled.connect(self._on_true_joint_toggled)
         inv_box_layout.addWidget(self.true_joint_stock_optimization)
+        if self.settings_in_ribbon:
+            # A real per-job judgment call (small urgent job vs. a big batch
+            # worth the extra search time), unlike the rest of this box --
+            # pulled out onto the ribbon itself. The toggled-signal wiring
+            # to joint_stock_optimization (which stays in the box, in the
+            # Settings dialog) is unaffected by which widget lives where.
+            inv_box_layout.removeWidget(self.true_joint_stock_optimization)
+            self.true_joint_stock_optimization.setParent(self)
+            self.true_joint_stock_optimization.hide()
         self._stash_settings("Stock", inv_box, top_layout)
 
         ga_box = QtWidgets.QGroupBox("Layout optimization")
@@ -716,7 +1468,7 @@ class NestingPanel(QtWidgets.QWidget):
         # final layout totals, instead of a static hint.
         self.ga_runtime = QtWidgets.QLabel("No search run yet -- Elapsed: --")
         self.ga_runtime.setObjectName("GaOperational")
-        self.ga_runtime.setStyleSheet("color: #8a8f98; font-size: 10px;")
+        self.ga_runtime.setObjectName("FieldHint")
         self.ga_runtime.setWordWrap(True)
         ga_form.addRow(self.ga_runtime)
         self._stash_settings("Layout", ga_box, top_layout)
@@ -792,14 +1544,14 @@ class NestingPanel(QtWidgets.QWidget):
         # cut length, estimated cut time, material cost -- not a static hint.
         self.cut_estimate = QtWidgets.QLabel("No layout yet -- run nesting to estimate cut time and cost.")
         self.cut_estimate.setObjectName("CostOperational")
-        self.cut_estimate.setStyleSheet("color: #8a8f98; font-size: 10px;")
+        self.cut_estimate.setObjectName("FieldHint")
         self.cut_estimate.setWordWrap(True)
         cost_form.addRow(self.cut_estimate)
         self._stash_settings("Export", cost_box, top_layout)
 
         label_box = QtWidgets.QGroupBox("Export details")
         label_layout = QtWidgets.QVBoxLayout(label_box)
-        self.label_enabled = QtWidgets.QCheckBox("Etch each part's name at export")
+        self.label_enabled = QtWidgets.QCheckBox("Add part name labels")
         self.label_enabled.setToolTip("Adds a TEXT entity (the part name) at each part's center, on a "
                                        "separate '<part>_LABEL' layer -- route that layer to a low-power "
                                        "engrave pass instead of cutting it.")
@@ -812,6 +1564,13 @@ class NestingPanel(QtWidgets.QWidget):
         label_form.addRow("Text height", self.label_height)
         label_layout.addWidget(self.label_enabled)
         label_layout.addLayout(label_form)
+        if self.settings_in_ribbon:
+            # Varies by customer/job (some want parts etched, some don't),
+            # unlike its Text height field which stays in the Settings
+            # dialog with the rest of this box -- pulled onto the ribbon.
+            label_layout.removeWidget(self.label_enabled)
+            self.label_enabled.setParent(self)
+            self.label_enabled.hide()
         self._stash_settings("Export", label_box, top_layout)
 
         common_line_box = QtWidgets.QGroupBox("Shared-edge cutting")
@@ -825,6 +1584,60 @@ class NestingPanel(QtWidgets.QWidget):
                                              "wins and this is skipped for that export.")
         common_line_layout.addWidget(self.common_line_enabled)
         self._stash_settings("Cutting", common_line_box, top_layout)
+
+        # The coefficients behind "Recommend from part thickness" (Layout
+        # basics, above) live in their own dialog rather than an inline
+        # group box here -- ten spinboxes is a lot of vertical space for
+        # something touched rarely, and it was crowding this tab. The
+        # dialog is built lazily on first open (_open_recommendation_settings);
+        # only the widgets it will contain are created now, unparented.
+        self._recommendation_dialog = None
+        rec_hint = QtWidgets.QLabel(
+            "Coefficients behind Layout basics' \"Recommend from part thickness\" button -- the published "
+            "DFM defaults below, or your own shop's kerf-verified numbers. Each recommended value is "
+            "min(max(multiplier x thickness, floor), ceiling); target spacing has no thickness term."
+        )
+        rec_hint.setWordWrap(True)
+        self._rec_hint_label = rec_hint
+        rec_form = QtWidgets.QFormLayout()
+
+        def _coef_spin(value, decimals=2, maximum=100.0, suffix=""):
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(0.0, maximum)
+            spin.setDecimals(decimals)
+            spin.setValue(value)
+            if suffix:
+                spin.setSuffix(suffix)
+            return spin
+
+        defaults = cutting_defaults.DEFAULT_COEFFICIENTS
+        self.rec_part_spacing_multiplier = _coef_spin(defaults["part_spacing_multiplier"], suffix=" x t")
+        self.rec_part_spacing_min = _coef_spin(defaults["part_spacing_min"], suffix=" mm")
+        self.rec_part_spacing_max = _coef_spin(defaults["part_spacing_max"], suffix=" mm")
+        self.rec_margin_multiplier = _coef_spin(defaults["margin_multiplier"], suffix=" x t")
+        self.rec_margin_min = _coef_spin(defaults["margin_min"], suffix=" mm")
+        self.rec_margin_max = _coef_spin(defaults["margin_max"], suffix=" mm")
+        self.rec_tab_width_multiplier = _coef_spin(defaults["tab_width_multiplier"], suffix=" x t")
+        self.rec_tab_width_min = _coef_spin(defaults["tab_width_min"], suffix=" mm")
+        self.rec_tab_width_max = _coef_spin(defaults["tab_width_max"], suffix=" mm")
+        self.rec_tab_target_spacing = _coef_spin(defaults["tab_target_spacing"], decimals=0, maximum=2000.0, suffix=" mm")
+
+        rec_form.addRow("Part spacing: multiplier", self.rec_part_spacing_multiplier)
+        rec_form.addRow("Part spacing: floor", self.rec_part_spacing_min)
+        rec_form.addRow("Part spacing: ceiling", self.rec_part_spacing_max)
+        rec_form.addRow("Margin: multiplier", self.rec_margin_multiplier)
+        rec_form.addRow("Margin: floor", self.rec_margin_min)
+        rec_form.addRow("Margin: ceiling", self.rec_margin_max)
+        rec_form.addRow("Tab width: multiplier", self.rec_tab_width_multiplier)
+        rec_form.addRow("Tab width: floor", self.rec_tab_width_min)
+        rec_form.addRow("Tab width: ceiling", self.rec_tab_width_max)
+        rec_form.addRow("Tab target spacing", self.rec_tab_target_spacing)
+        self._rec_form_layout = rec_form
+
+        self.rec_reset_btn = QtWidgets.QPushButton("Reset to industry defaults")
+        self.rec_reset_btn.setToolTip("Restores cutting_defaults.py's published-DFM-guideline coefficients, "
+                                       "discarding any of your own overrides above.")
+        self.rec_reset_btn.clicked.connect(self._reset_recommendation_coefficients)
 
         report_box = QtWidgets.QGroupBox("Nesting report")
         report_layout = QtWidgets.QVBoxLayout(report_box)
@@ -857,7 +1670,7 @@ class NestingPanel(QtWidgets.QWidget):
         # Operational readout: what the last report run actually produced.
         self.report_status = QtWidgets.QLabel("No report written yet.")
         self.report_status.setObjectName("ReportOperational")
-        self.report_status.setStyleSheet("color: #8a8f98; font-size: 10px;")
+        self.report_status.setObjectName("FieldHint")
         self.report_status.setWordWrap(True)
         report_layout.addWidget(self.report_status)
         self._stash_settings("Export", report_box, top_layout)
@@ -901,14 +1714,29 @@ class NestingPanel(QtWidgets.QWidget):
             # explicitly rather than just omitting it from the layout.
             rescan_row_widget.hide()
 
-        self.table = _PartsTable(0, 8)
+        self.table = _PartsTable(0, 9)
         self.table.setHorizontalHeaderLabels(
             ["Part", "Material", "Qty / assembly", "Rotations (deg)", "Thickness", "Grain-restricted",
-             "Mirror", "Method"]
+             "Mirror", "Method", ""]
         )
-        self.table.horizontalHeader().setStretchLastSection(True)
+        # The columns share the table's width evenly, so nothing truncates
+        # and nothing is marooned at the far edge. (Stretching just the
+        # "Method" column, as this did before, handed half the table to the
+        # word "unfold" while truncating four headings and the part names.)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(8, QtWidgets.QHeaderView.Fixed)
+        header.setMinimumSectionSize(80)
+        header.setHighlightSections(False)
+        header.setDefaultAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.table.setColumnWidth(8, 34)
         self.table.verticalHeader().setVisible(False)
-        self.table.setIconSize(QtCore.QSize(32, 32))
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.setShowGrid(False)   # row hairlines only -- see native_app/theme.py
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setIconSize(QtCore.QSize(26, 26))
         self.table.itemChanged.connect(self._on_table_item_changed)
         self.table.itemChanged.connect(self._refresh_preflight)
         self.table.delete_requested.connect(self._remove_selected_parts)
@@ -935,17 +1763,24 @@ class NestingPanel(QtWidgets.QWidget):
         # is worth roughly 1px of sheet rendering -- a second control row is
         # real estate given away.
         nav_row = QtWidgets.QHBoxLayout()
+        self.nav_row = nav_row   # kept so a host can restyle/extend the sheet navigation line
         self.sheet_selector = QtWidgets.QComboBox()
         self.sheet_selector.setToolTip("Jump straight to any sheet in this job -- like Lantek's Nesting "
                                         "Explorer tree, but flattened into one dropdown since a nested job "
                                         "here is a single material/thickness cascade, not a multi-job tree.")
         self.sheet_selector.activated.connect(self._on_sheet_selector_activated)
-        self.prev_btn = QtWidgets.QPushButton("<<")
+        # Chevrons, not "<<" / ">>": paging controls are a shape people
+        # read at a glance, and ASCII arrows are the oldest tell in a UI.
+        self.prev_btn = QtWidgets.QPushButton("\u2039")
+        self.prev_btn.setObjectName("NavButton")
+        self.prev_btn.setFixedWidth(34)
         self.prev_btn.setToolTip("Previous sheet")
         self.prev_btn.clicked.connect(self._prev_sheet)
         self.sheet_label = QtWidgets.QLabel("No sheets yet")
         self.sheet_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.next_btn = QtWidgets.QPushButton(">>")
+        self.next_btn = QtWidgets.QPushButton("\u203a")
+        self.next_btn.setObjectName("NavButton")
+        self.next_btn.setFixedWidth(34)
         self.next_btn.setToolTip("Next sheet")
         self.next_btn.clicked.connect(self._next_sheet)
         # Sheet jump control sits left (same spot its own row had), then a
@@ -957,18 +1792,30 @@ class NestingPanel(QtWidgets.QWidget):
         nav_row.addWidget(self.sheet_selector)
         nav_row.addWidget(QtWidgets.QLabel("Zoom"))
         self.zoom_spin = QtWidgets.QDoubleSpinBox()
-        self.zoom_spin.setRange(0.5, 4.0)
-        self.zoom_spin.setSingleStep(0.1)
+        self.zoom_spin.setRange(_ZOOM_MIN, _ZOOM_MAX)
+        self.zoom_spin.setStepType(QtWidgets.QAbstractSpinBox.AdaptiveDecimalStepType)
         self.zoom_spin.setDecimals(2)
         self.zoom_spin.setSuffix("x")
         self.zoom_spin.setValue(1.0)
         self.zoom_spin.setFixedWidth(80)
-        self.zoom_spin.setToolTip("Magnify the sheet beyond its fit-to-screen size. "
-                                   "1.00x shows the whole sheet; higher zooms crop around the "
-                                   "sheet's center (the mouse wheel over the preview does the same).")
+        self.zoom_spin.setToolTip("Magnify the sheet beyond its fit-to-screen size (up to 100x). "
+                                   "1.00x shows the whole sheet. Over the sheet, the mouse wheel "
+                                   "zooms at the cursor and dragging with the middle button pans, "
+                                   "as in LibreCAD.")
         self.zoom_spin.valueChanged.connect(self.preview.set_zoom)
         self.preview.zoom_changed.connect(self.zoom_spin.setValue)
         nav_row.addWidget(self.zoom_spin)
+        self.measure_toggle = QtWidgets.QPushButton("Measure")
+        self.measure_toggle.setCheckable(True)
+        self.measure_toggle.setToolTip("Measure a distance on the sheet (M): click a start point, then an "
+                                       "end point. Points snap to part and sheet corners, then to part "
+                                       "edges. Esc or right-click clears; again to leave Measure.")
+        self.measure_toggle.toggled.connect(self.preview.set_measure_mode)
+        self.preview.measure_mode_changed.connect(self.measure_toggle.setChecked)
+        self.preview.measured.connect(self._on_measured)
+        QtGui.QShortcut(QtGui.QKeySequence("M"), self, self.measure_toggle.toggle,
+                        context=QtCore.Qt.WidgetWithChildrenShortcut)
+        nav_row.addWidget(self.measure_toggle)
         nav_row.addWidget(self.prev_btn)
         nav_row.addWidget(self.sheet_label, 1)
         nav_row.addWidget(self.next_btn)
@@ -1053,22 +1900,44 @@ class NestingPanel(QtWidgets.QWidget):
 
         layouts_col = QtWidgets.QWidget()
         layouts_layout = QtWidgets.QVBoxLayout(layouts_col)
-        layouts_layout.addWidget(QtWidgets.QLabel("Layout results"))
+        layouts_layout.setContentsMargins(6, 0, 0, 0)
+        layouts_layout.setSpacing(6)
+        layouts_caption = QtWidgets.QLabel("LAYOUT RESULTS")
+        layouts_caption.setObjectName("SectionCaption")
+        layouts_layout.addWidget(layouts_caption)
         self.layout_list = QtWidgets.QListWidget()
-        self.layout_list.setIconSize(QtCore.QSize(96, 96))
+        self.layout_list.setIconSize(QtCore.QSize(64, 64))
+        self.layout_list.setWordWrap(True)
+        self.layout_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.layout_list.itemClicked.connect(self._on_layout_candidate_clicked)
+        self._show_layout_placeholder()   # says what will fill it, from the first frame
         layouts_layout.addWidget(self.layout_list)
+        # Capped, not left to share the splitter equally: a thumbnail list of
+        # past attempts is a secondary lookup tool, not the thing being
+        # worked on. SigmaNEST/LaserNest keep their equivalent side panels as
+        # thin strips and let the cutting canvas dominate the window --
+        # equal-thirds/equal-halves here was doing the opposite by default.
+        layouts_col.setMaximumWidth(250)
+        # ...and a floor as well as a ceiling: the splitter's pane sizes are
+        # restored from the last session, and a saved size from a different
+        # window layout could squeeze this column down to the width of its
+        # own thumbnails, leaving every row's text scrolled out of sight.
+        layouts_col.setMinimumWidth(212)
         splitter.addWidget(layouts_col)
         self.layouts_col = layouts_col
         self.splitter = splitter  # kept so the results toggle can resize panes
 
         if self.show_actions:
-            splitter.setStretchFactor(0, 1)
-            splitter.setStretchFactor(1, 1)
-            splitter.setStretchFactor(2, 1)
+            splitter.setStretchFactor(0, 1)  # parts table
+            splitter.setStretchFactor(1, 4)  # preview/manual column -- dominant
+            splitter.setStretchFactor(2, 0)  # layout results -- capped by max width above
+            total = 1100
+            splitter.setSizes([total * 3 // 10, total * 6 // 10, total // 10])
         else:
-            splitter.setStretchFactor(0, 1)  # preview/manual column
-            splitter.setStretchFactor(1, 1)  # layout-results column
+            splitter.setStretchFactor(0, 1)  # preview/manual column -- dominant
+            splitter.setStretchFactor(1, 0)  # layout-results column -- capped by max width above
+            total = 900
+            splitter.setSizes([total * 4 // 5, total // 5])
         root.addWidget(splitter, 1)
 
         self.stats_label = QtWidgets.QLabel("Elapsed: -- -- no sheets yet.")
@@ -1083,13 +1952,12 @@ class NestingPanel(QtWidgets.QWidget):
             self.stats_label.hide()
 
         status_row = QtWidgets.QHBoxLayout()
+        self.status_row = status_row   # same reason as nav_row
         status_row.setContentsMargins(4, 0, 4, 0)
         self.sheet_pos_label = QtWidgets.QLabel("Sheet -- of --")
         self.sheet_pos_label.setObjectName("SheetPosReadout")
-        self.sheet_pos_label.setStyleSheet("color: #8a8f98; font-weight: 600;")
         self.coord_label = QtWidgets.QLabel("X: --   Y: -- mm")
         self.coord_label.setObjectName("CoordReadout")
-        self.coord_label.setStyleSheet("color: #8a8f98;")
         self.coord_label.setAlignment(QtCore.Qt.AlignRight)
         status_row.addWidget(self.sheet_pos_label)
         status_row.addStretch(1)
@@ -1097,6 +1965,7 @@ class NestingPanel(QtWidgets.QWidget):
         root.addLayout(status_row)
 
         self.log = QtWidgets.QPlainTextEdit()
+        self.log.setObjectName("ConsoleLog")   # monospaced, sunken -- see native_app/theme.py
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(90)
         self.log.setMinimumSize(0, 46)
@@ -1359,7 +2228,7 @@ class NestingPanel(QtWidgets.QWidget):
         painter.setBrush(part_colors.color_for(name))
         painter.drawPath(path)
         painter.end()
-        return QtGui.QIcon(pix)
+        return untinted_icon(pix)
 
     def _add_table_row(self, label, data, material="unspecified", quantity=1,
                         rotations="0,90,180,270", grain_restricted=False, mirror=False):
@@ -1414,6 +2283,18 @@ class NestingPanel(QtWidgets.QWidget):
         for col in (0, 4, 7):
             item = self.table.item(row, col)
             item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+
+        # A quiet in-row affordance, not a button: borderless until
+        # hovered. (Named so the app stylesheet can strip the normal
+        # button padding -- at 28px wide with it, the glyph was clipped to
+        # an empty white box.)
+        delete_btn = QtWidgets.QPushButton("✕")
+        delete_btn.setObjectName("RowDelete")
+        delete_btn.setToolTip(f"Remove {label} from the job")
+        delete_btn.setFixedSize(26, 26)
+        delete_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        delete_btn.clicked.connect(self._delete_row_button_clicked)
+        self.table.setCellWidget(row, 8, delete_btn)
 
     def _on_table_item_changed(self, item):
         if item.column() != 5:  # only react to the Grain-restricted checkbox
@@ -1546,7 +2427,14 @@ class NestingPanel(QtWidgets.QWidget):
         self._update_readiness()
 
     def _load_inventory(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load inventory JSON", "", "JSON (*.json)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load stock inventory", "",
+            # Excel first -- it's the format the Stock tab writes and the one
+            # a stock list should be in. .json is still offered because
+            # inventories written before that change still open.
+            "Stock inventory (*.xlsx *.xlsm *.json);;Excel workbook (*.xlsx *.xlsm);;"
+            "Inventory JSON, legacy (*.json)",
+        )
         if not path:
             return
         try:
@@ -1632,6 +2520,7 @@ class NestingPanel(QtWidgets.QWidget):
         with open(path, "w") as f:
             json.dump(self._job_state(), f, indent=2)
         self._job_path = path
+        self.job_path_changed.emit(path)
         self._log(f"Saved job to {path}.")
 
     def _load_job(self, path):
@@ -1719,6 +2608,7 @@ class NestingPanel(QtWidgets.QWidget):
         self._show_sheet()
 
         self._job_path = path
+        self.job_path_changed.emit(path)
         self._log(f"Opened job {path} ({len(data.get('parts', []))} part(s)).")
         self.parts_changed.emit()
 
@@ -1788,7 +2678,21 @@ class NestingPanel(QtWidgets.QWidget):
         if not rows:
             self._log("Remove Selected Part: nothing selected.")
             return
-        for row in rows:
+        self._remove_table_rows(rows)
+
+    def _delete_row_button_clicked(self):
+        # The clicked button's row can't be captured at connect time -- an
+        # earlier row's deletion shifts every row below it up, which would
+        # make a captured index stale. Look up the button's current row
+        # instead, by identity, at click time.
+        btn = self.sender()
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, 8) is btn:
+                self._remove_table_rows([row])
+                return
+
+    def _remove_table_rows(self, rows):
+        for row in sorted(rows, reverse=True):
             label = self.table.item(row, 0).text()
             self._extracted.pop(label, None)
             self.table.removeRow(row)
@@ -1802,6 +2706,18 @@ class NestingPanel(QtWidgets.QWidget):
             "margin_top": self.margin_top.value(), "margin_bottom": self.margin_bottom.value(),
             "allow_hole_nesting": self.allow_hole_nesting.isChecked(),
             "hole_clearance": self.hole_clearance.value(),
+        }
+
+    def _current_cutting_params(self):
+        """The nesting-time cutting parameters as of right now -- snapshotted
+        into self._last_run_cutting_params at the start of each real run
+        (_run()/_optimize_ordering()) so the report can show what actually
+        produced the layout on screen, not whatever the sliders read at
+        report-build time (which may have been changed since)."""
+        return {
+            "part_spacing": self.part_spacing.value(),
+            "margin_left": self.margin_left.value(), "margin_right": self.margin_right.value(),
+            "margin_top": self.margin_top.value(), "margin_bottom": self.margin_bottom.value(),
         }
 
     def _sync_margins(self, value):
@@ -1862,10 +2778,14 @@ class NestingPanel(QtWidgets.QWidget):
         technique _export_report() uses for its embedded images, just via
         a temporary, never-shown SheetPreview instead of the live one."""
         preview = SheetPreview()
+        # The same canvas palette as the live sheet view it stands for (the
+        # host decides whether that differs from the theme -- see
+        # set_canvas_palette).
+        preview.use_canvas_palette = self.preview.use_canvas_palette
         preview.resize(size, size)
         preview.set_sheet(w, h, sheet, self._microjoint_cfg(), self._common_line_cfg())
         pix = preview.grab()
-        return QtGui.QIcon(pix)
+        return untinted_icon(pix)
 
     def _update_placed_counts(self):
         """Tints each row's Qty spinbox by how much of that part actually
@@ -1901,43 +2821,32 @@ class NestingPanel(QtWidgets.QWidget):
                 color = "#ffd479"  # amber -- partially placed
             else:
                 color = "#f28b82"  # red -- none placed
-            qty_widget.setStyleSheet(f"QSpinBox {{ background-color: {color}; color: #1b1d22; }}")
+            qty_widget.setStyleSheet(
+                f"QSpinBox {{ background-color: {color}; color: #1b1d22;"
+                f" border: 1px solid {color}; border-radius: 6px; }}"
+            )
         if summary:
             self._log(
                 "  Placement summary: " + " · ".join(summary)
                 + (" -- everything placed" if short_total == 0 else f" ({short_total} part(s) short)")
             )
 
-    def _record_candidate(self, method):
-        """Snapshots the just-finished run as a browsable candidate in the
-        Layout Results panel -- called at the end of a nesting run,
-        after self.sheets/etc. are already set to that result."""
-        if not self.sheets:
-            return
-        self.layout_candidates.append({
-            "sheets": self.sheets, "sheet_dims": self.sheet_dims,
-            "sheet_job_label": self.sheet_job_label, "sheet_prices": self.sheet_prices,
-            "used_stock": self.used_stock,
-            "unplaced": list(self.unplaced), "method": method,
-            "timestamp": time.strftime("%H:%M:%S"),
-            # Commit reads these, not self.sheets directly -- capture them
-            # too so re-selecting an older candidate and committing acts on
-            # what's actually shown, not whatever the most recent run was.
-            "last_run_parts": self._last_run_parts,
-            "last_run_used_ga": self._last_run_used_ga,
-            "last_run_ga_kwargs": self._last_run_ga_kwargs,
-        })
-        del self.layout_candidates[:-_MAX_LAYOUT_CANDIDATES]
-        self._refresh_layout_list()
-
     def _refresh_layout_list(self):
         """Rebuilds the Layout Results panel as one row per SHEET of the
         current run (they're styled with a 96px sheet thumbnail and the
         same per-part colors), so the panel truthfully shows every sheet
-        the nesting produced. Clicking a row jumps the preview to it."""
+        the nesting produced. Clicking a row jumps the preview to it.
+
+        Gated on self.sheets, not on the run having finished -- called live
+        from _optimize_ordering()'s progress_callback too (once per GA
+        generation), so the list fills in with each sheet of the current
+        best candidate WHILE the search is still running, not only once it
+        completes. That's what lets Layout Results replace << / >> for
+        browsing between sheets during a live search, not just afterward."""
         self.layout_list.clear()
-        if not self.layout_candidates:
-            return  # no run completed yet (or a new job cleared it)
+        if not self.sheets:
+            self._show_layout_placeholder()
+            return
         n_sheets = len(self.sheets)
         for i, (sheet, dims) in enumerate(zip(self.sheets, self.sheet_dims)):
             w, h = dims
@@ -1945,27 +2854,40 @@ class NestingPanel(QtWidgets.QWidget):
             used = sum(pp.net_area() for pp in sheet)
             util = 100.0 * used / area if area > 0 else 0.0
             job_label = self.sheet_job_label[i]
-            prefix = f"{job_label} -- " if job_label else ""
-            label = (f"{prefix}Sheet {i + 1} / {n_sheets}\n"
-                     f"{w:g}x{h:g} mm, {len(sheet)} parts, {util:.1f}% util")
+            # Three short lines in a narrow column, most important first --
+            # the old single run-on line ("Mild Steel / 2 mm -- Sheet 1 / 2
+            # -- 300x450 mm, 4 parts, 17.0% util") wrapped into a paragraph
+            # in a 110px-wide gap beside the thumbnail.
+            label = (f"Sheet {i + 1} of {n_sheets}\n"
+                     f"{w:g} × {h:g} mm · {len(sheet)} parts · {util:.0f}%")
+            if job_label:
+                label += f"\n{job_label}"
             item = QtWidgets.QListWidgetItem(
                 self._sheet_thumbnail(w, h, sheet) if sheet else QtGui.QIcon(),
                 label,
             )
+            item.setToolTip(f"{job_label + ' -- ' if job_label else ''}Sheet {i + 1} of {n_sheets}: "
+                            f"{w:g} x {h:g} mm, {len(sheet)} parts, {util:.1f}% utilization")
             item.setData(QtCore.Qt.UserRole, i)
             self.layout_list.addItem(item)
         if 0 <= self.current_sheet_index < self.layout_list.count():
             self.layout_list.setCurrentRow(self.current_sheet_index)
 
-    def _clear_layout_candidates(self):
-        """Drops every accumulated Layout Results candidate so the list
-        reflects only the run about to start. Each run records exactly one
-        candidate, so old runs' results never linger next to the new one."""
-        self.layout_candidates = []
-        self._refresh_layout_list()
+    def _show_layout_placeholder(self):
+        """An empty results panel that says nothing looks broken; one that
+        says what will fill it is just waiting. The row is unselectable and
+        unclickable, so it can never be mistaken for a sheet."""
+        self.layout_list.clear()
+        placeholder = QtWidgets.QListWidgetItem("No layouts yet.\nRun Nesting to fill this in.")
+        placeholder.setFlags(QtCore.Qt.ItemIsEnabled & ~QtCore.Qt.ItemIsSelectable)
+        placeholder.setTextAlignment(QtCore.Qt.AlignCenter)
+        placeholder.setForeground(QtGui.QColor(HINT_COLOR))
+        self.layout_list.addItem(placeholder)
 
     def _on_layout_candidate_clicked(self, item):
         idx = item.data(QtCore.Qt.UserRole)
+        if idx is None:
+            return  # the "no layouts yet" placeholder, not a sheet
         if 0 <= idx < len(self.sheets):
             self.current_sheet_index = idx
             self._show_sheet()
@@ -1978,11 +2900,12 @@ class NestingPanel(QtWidgets.QWidget):
             return
         if not self._require_preflight("run nesting"):
             return
-        self._clear_layout_candidates()
+        self.layout_list.clear()  # blank stale rows before this run's own results replace them
 
         start_time = time.time()
         parts = self._table_parts()
         self._last_run_parts = parts
+        self._last_run_cutting_params = self._current_cutting_params()
         self._last_run_used_ga = False
         self._last_run_ga_kwargs = None
         self.commit_btn.setEnabled(False)  # stale until this run finishes below
@@ -2037,7 +2960,7 @@ class NestingPanel(QtWidgets.QWidget):
         self.commit_btn.setEnabled(bool(self.sheets) and self._inventory_path is not None)
         self._set_stats(self._job_stats_text(time.time() - start_time))
         self._update_placed_counts()
-        self._record_candidate("Run Nesting")
+        self._refresh_layout_list()
         self._show_sheet()
         self._write_auto_report()
 
@@ -2047,13 +2970,14 @@ class NestingPanel(QtWidgets.QWidget):
             return
         if not self._require_preflight("run nesting"):
             return
-        self._clear_layout_candidates()
+        self.layout_list.clear()  # blank stale rows before this run's own results replace them
 
         start_time = time.time()
         self._search_started_at = time.monotonic()
         self._stop_requested = False
         parts = self._table_parts()
         self._last_run_parts = parts
+        self._last_run_cutting_params = self._current_cutting_params()
         self.commit_btn.setEnabled(False)  # stale until this run finishes below
 
         buttons = self.findChildren(QtWidgets.QPushButton)
@@ -2064,7 +2988,7 @@ class NestingPanel(QtWidgets.QWidget):
         self.busy_changed.emit(True)
         QtWidgets.QApplication.processEvents()
 
-        def progress(gen, fitness, best_sheets, sheet_w, sheet_h):
+        def ui_progress(gen, fitness, best_sheets, sheet_w, sheet_h):
             live_gen[0] = gen
             sheets_used, unplaced_count, neg_util = fitness
             elapsed = time.time() - start_time
@@ -2074,12 +2998,35 @@ class NestingPanel(QtWidgets.QWidget):
                 f"Elapsed: {elapsed:.1f}s -- generation {gen}, {sheets_used} sheet(s) so far, "
                 f"{-neg_util * 100:.1f}% efficiency on the current pass"
             )
-            # Live preview: redraw the current best ordering's first sheet as
-            # the search improves, rather than only showing the final result.
-            first_sheet = best_sheets[0] if best_sheets else []
-            self.sheet_label.setText(f"Live preview -- generation {gen}...")
-            self.preview.set_sheet(sheet_w, sheet_h, first_sheet, self._microjoint_cfg(), self._common_line_cfg())
-            QtWidgets.QApplication.processEvents()
+            # Live preview AND live Layout Results: self.sheets is kept in
+            # sync with the current-best candidate every generation (not
+            # just once at the very end), so Layout Results already shows
+            # one clickable row per sheet WHILE the search runs -- that's
+            # what lets it replace << / >> for browsing sheets mid-search.
+            # job_label/price/stock aren't known yet mid-cascade-pass, so
+            # they're left blank/None here; the final _refresh_layout_list()
+            # call after the whole run finishes fills in the real ones.
+            clean = [s for s in best_sheets if s]
+            self.sheets = clean
+            self.sheet_dims = [(sheet_w, sheet_h)] * len(clean)
+            self.sheet_job_label = [""] * len(clean)
+            self.sheet_prices = [None] * len(clean)
+            self.used_stock = [None] * len(clean)
+            # Re-show whichever sheet is currently selected (clamped to this
+            # generation's sheet count), not always sheet 1 -- so clicking a
+            # row in Layout Results while this is running stays picked
+            # instead of snapping back every generation.
+            if clean:
+                self.current_sheet_index = min(self.current_sheet_index, len(clean) - 1)
+                shown = self.sheets[self.current_sheet_index]
+            else:
+                shown = []
+            self.sheet_label.setText(
+                f"Live preview -- generation {gen}, sheet {self.current_sheet_index + 1}/{len(clean)}..."
+                if clean else f"Live preview -- generation {gen}..."
+            )
+            self.preview.set_sheet(sheet_w, sheet_h, shown, self._microjoint_cfg(), self._common_line_cfg())
+            self._refresh_layout_list()
 
         # Live per-part placement animation: every candidate's parts appear
         # on the sheet one at a time as the search evaluates it, instead of
@@ -2090,11 +3037,7 @@ class NestingPanel(QtWidgets.QWidget):
         live_gen = [0]
         live_last_paint = [0.0]
 
-        def placement(sheets, _p_unplaced, idx, total, name, sheet_idx, placed_ok, sheet_w, sheet_h):
-            now = time.monotonic()
-            if now - live_last_paint[0] < 0.03:
-                return
-            live_last_paint[0] = now
+        def ui_placement(sheets, idx, total, name, sheet_idx, placed_ok, sheet_w, sheet_h):
             clean = [s for s in sheets if s]
             if not clean:
                 return
@@ -2105,7 +3048,26 @@ class NestingPanel(QtWidgets.QWidget):
                 f"(on sheet {sheet_idx + 1}) -- {len(clean)} sheet(s) so far..."
             )
             self.preview.set_sheet(sheet_w, sheet_h, display, self._microjoint_cfg(), self._common_line_cfg())
-            QtWidgets.QApplication.processEvents()
+
+        # The search itself runs on a worker thread (below), so the window
+        # keeps repainting, the elapsed timer keeps ticking and Stop keeps
+        # working however long one step of the search takes -- in parallel
+        # mode a whole generation passes between callbacks, and on the GUI
+        # thread that froze the window ("not responding") for minutes. These
+        # two worker-side callbacks only copy what they were handed (the
+        # search keeps mutating its own lists) and hand it to the relay.
+        relay = _SearchRelay(ui_progress, ui_placement, self)
+
+        def progress(gen, fitness, best_sheets, sheet_w, sheet_h):
+            relay.progress.emit((gen, fitness, [list(s) for s in best_sheets], sheet_w, sheet_h))
+
+        def placement(sheets, _p_unplaced, idx, total, name, sheet_idx, placed_ok, sheet_w, sheet_h):
+            now = time.monotonic()
+            if now - live_last_paint[0] < 0.03:
+                return
+            live_last_paint[0] = now
+            relay.placement.emit(([list(s) for s in sheets], idx, total, name, sheet_idx,
+                                  placed_ok, sheet_w, sheet_h))
 
         # Fix a seed up front (rather than leaving it random) so that if this
         # run is later committed, _commit_inventory() can replay the exact
@@ -2128,23 +3090,63 @@ class NestingPanel(QtWidgets.QWidget):
         self.sheet_prices = []
         self.used_stock = []
         self.unplaced = []
+        # The search is about to start filling the canvas live -- drop the
+        # "No layout yet" placeholder so it can't linger over real progress.
+        self.preview.set_hint("")
+        # Every widget value the search needs is read HERE, on the GUI
+        # thread, before the worker starts.
+        use_inventory = self._inventory_template is not None
+        search_kwargs = dict(kerf=self.part_spacing.value(), should_stop=lambda: self._stop_requested,
+                             **self._margin_kwargs())
+        if use_inventory:
+            working_stock = copy.deepcopy(self._inventory_template)
+            search_kwargs.update(
+                use_ga=True, ga_kwargs=ga_kwargs,
+                joint_stock_optimization=self.joint_stock_optimization.isChecked(),
+                true_joint_stock_optimization=self.true_joint_stock_optimization.isChecked(),
+                prefer_remnants=self.prefer_remnants.isChecked())
+            search = lambda: inv.run_job(parts, working_stock, **search_kwargs)  # noqa: E731
+        else:
+            sheet_w, sheet_h = self.sheet_w.value(), self.sheet_h.value()
+            search = lambda: genetic.optimize_order(sheet_w, sheet_h, parts,  # noqa: E731
+                                                    **search_kwargs, **ga_kwargs)
+        outcome = {}
+
+        def work():
+            try:
+                outcome["result"] = search()
+            except Exception as e:  # noqa: BLE001 -- reported on the GUI thread below
+                outcome["error"] = e
+            finally:
+                relay.done.emit()
+
+        waiting = QtCore.QEventLoop()
+        relay.done.connect(waiting.quit, QtCore.Qt.QueuedConnection)
+        worker = threading.Thread(target=work, name="nesting-search", daemon=True)
         try:
-            if self._inventory_template is not None:
-                working_stock = copy.deepcopy(self._inventory_template)
-                results = inv.run_job(parts, working_stock, kerf=self.part_spacing.value(),
-                                       use_ga=True, ga_kwargs=ga_kwargs,
-                                       joint_stock_optimization=self.joint_stock_optimization.isChecked(),
-                                       true_joint_stock_optimization=self.true_joint_stock_optimization.isChecked(),
-                                       prefer_remnants=self.prefer_remnants.isChecked(),
-                                       should_stop=lambda: self._stop_requested,
-                                       **self._margin_kwargs())
+            worker.start()
+            waiting.exec()   # the window stays live; the relay paints progress meanwhile
+            worker.join()
+            relay.active = False
+            if "error" in outcome:
+                raise outcome["error"]
+            # The live progress updates filled these with the search's
+            # in-flight candidates; the result starts from a clean slate,
+            # not appended after the last candidate shown (which used to
+            # leave a stale, unlabelled duplicate sheet at the front of every
+            # inventory run -- "3 sheets, 16 parts placed" for a 10-part job).
+            self.sheets, self.sheet_dims, self.sheet_job_label = [], [], []
+            self.sheet_prices, self.used_stock, self.unplaced = [], [], []
+            if use_inventory:
+                results = outcome["result"]
                 self._last_run_used_ga = True
-                # The live-placement callback is observation-only; omit it
-                # from the replay record so _commit_inventory()'s re-run
-                # doesn't animate (there's no final _show_sheet() after a
-                # commit, so a live frame would otherwise be left frozen on
-                # a half-assembled candidate on-screen).
-                self._last_run_ga_kwargs = {k: v for k, v in ga_kwargs.items() if k != "placement_callback"}
+                # The live callbacks are observation-only; omit them from the
+                # replay record so _commit_inventory()'s re-run doesn't
+                # animate -- they now post to this run's relay, whose
+                # updates would land after the commit and paint a
+                # half-assembled candidate over the committed layout.
+                self._last_run_ga_kwargs = {k: v for k, v in ga_kwargs.items()
+                                            if k not in ("placement_callback", "progress_callback")}
                 for r in results:
                     job_label = f"{r.material} / {r.thickness:g} mm"
                     for sheet, stock in zip(r.sheets, r.sheet_stock):
@@ -2159,11 +3161,7 @@ class NestingPanel(QtWidgets.QWidget):
                     for note in r.notes:
                         self._log(f"  [note] {note}")
             else:
-                sheets, unplaced = genetic.optimize_order(
-                    self.sheet_w.value(), self.sheet_h.value(), parts, kerf=self.part_spacing.value(),
-                    should_stop=lambda: self._stop_requested,
-                    **self._margin_kwargs(), **ga_kwargs,
-                )
+                sheets, unplaced = outcome["result"]
                 self._last_run_used_ga = False  # nothing to replay -- no inventory to commit against
                 self._last_run_ga_kwargs = None
                 self.sheets = [s for s in sheets if s]
@@ -2178,6 +3176,7 @@ class NestingPanel(QtWidgets.QWidget):
             self._log(f"[error] genetic ordering search failed: {e}")
             return
         finally:
+            relay.active = False
             self._search_timer.stop()
             self._search_started_at = None
             for b in buttons:
@@ -2193,7 +3192,7 @@ class NestingPanel(QtWidgets.QWidget):
         )
         self._set_stats(self._job_stats_text(time.time() - start_time))
         self._update_placed_counts()
-        self._record_candidate("Run Nesting")
+        self._refresh_layout_list()
         self._show_sheet()
         self._write_auto_report()
 
@@ -2242,6 +3241,95 @@ class NestingPanel(QtWidgets.QWidget):
         self.commit_btn.setEnabled(False)  # last run's parts are now already committed
         self.inventory_changed.emit()
 
+    def _open_recommendation_settings(self):
+        """Shows the "Recommendation formula" dialog -- built once, lazily,
+        on first open (from the widgets _build_ui() already constructed
+        but never parented into the main panel, to keep that tab short).
+        Non-modal: the coefficient fields are read fresh by
+        _recommendation_coefficients() whenever "Recommend from part
+        thickness" is actually clicked, so there's nothing to "apply" --
+        editing here and using the main window at the same time is fine."""
+        if self._recommendation_dialog is None:
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Recommendation formula")
+            layout = QtWidgets.QVBoxLayout(dialog)
+            layout.addWidget(self._rec_hint_label)
+            layout.addLayout(self._rec_form_layout)
+            layout.addWidget(self.rec_reset_btn)
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.clicked.connect(dialog.close)
+            layout.addWidget(close_btn)
+            self._recommendation_dialog = dialog
+        self._recommendation_dialog.show()
+        self._recommendation_dialog.raise_()
+        self._recommendation_dialog.activateWindow()
+
+    def _recommendation_coefficients(self):
+        """The "Recommendation formula" settings box's current values, in
+        cutting_defaults.py's coefficient-dict shape -- lets that box's
+        edits (or its industry-default starting point) drive the
+        "Recommend from part thickness" button instead of the module's
+        own hardcoded constants."""
+        return {
+            "part_spacing_multiplier": self.rec_part_spacing_multiplier.value(),
+            "part_spacing_min": self.rec_part_spacing_min.value(),
+            "part_spacing_max": self.rec_part_spacing_max.value(),
+            "margin_multiplier": self.rec_margin_multiplier.value(),
+            "margin_min": self.rec_margin_min.value(),
+            "margin_max": self.rec_margin_max.value(),
+            "tab_width_multiplier": self.rec_tab_width_multiplier.value(),
+            "tab_width_min": self.rec_tab_width_min.value(),
+            "tab_width_max": self.rec_tab_width_max.value(),
+            "tab_target_spacing": self.rec_tab_target_spacing.value(),
+        }
+
+    def _reset_recommendation_coefficients(self):
+        defaults = cutting_defaults.DEFAULT_COEFFICIENTS
+        self.rec_part_spacing_multiplier.setValue(defaults["part_spacing_multiplier"])
+        self.rec_part_spacing_min.setValue(defaults["part_spacing_min"])
+        self.rec_part_spacing_max.setValue(defaults["part_spacing_max"])
+        self.rec_margin_multiplier.setValue(defaults["margin_multiplier"])
+        self.rec_margin_min.setValue(defaults["margin_min"])
+        self.rec_margin_max.setValue(defaults["margin_max"])
+        self.rec_tab_width_multiplier.setValue(defaults["tab_width_multiplier"])
+        self.rec_tab_width_min.setValue(defaults["tab_width_min"])
+        self.rec_tab_width_max.setValue(defaults["tab_width_max"])
+        self.rec_tab_target_spacing.setValue(defaults["tab_target_spacing"])
+        self._log("[recommend] Recommendation formula reset to industry defaults.")
+
+    def _recommend_cutting_params(self):
+        """"Recommend from part thickness" button: fills part spacing,
+        margins, and microjoint tab width/spacing from the "Recommendation
+        formula" settings box's coefficients (industry defaults unless
+        edited), for whatever thickness(es) are on the currently loaded
+        parts. See cutting_defaults.py's docstring for the exact rules and
+        their sources."""
+        thicknesses = sorted({data.get("thickness") for data in self._extracted.values()
+                               if data.get("thickness") is not None})
+        if not thicknesses:
+            self._log("[recommend] No part thickness known yet -- import/scan parts first. "
+                       "(A DXF import carries no thickness at all; set it via a material/thickness "
+                       "override or edit the Parts table before recommending.)")
+            return
+
+        rec = cutting_defaults.recommend_defaults_for_many(thicknesses, self._recommendation_coefficients())
+        self.part_spacing.setValue(rec["part_spacing"])
+        for spin in (self.margin_left, self.margin_right, self.margin_top, self.margin_bottom):
+            spin.setValue(rec["margin"])
+        self.microjoint_width.setValue(rec["microjoint_tab_width"])
+        self.microjoint_spacing.setValue(rec["microjoint_target_spacing"])
+
+        if len(thicknesses) == 1:
+            self._log(f"[recommend] Applied industry-standard defaults for {thicknesses[0]:g} mm: "
+                       f"part spacing {rec['part_spacing']:.2f} mm, margin {rec['margin']:.2f} mm, "
+                       f"microjoint tab width {rec['microjoint_tab_width']:.2f} mm.")
+        else:
+            self._log(f"[recommend] Mixed thicknesses loaded ({', '.join(f'{t:g}mm' for t in thicknesses)}) -- "
+                       "one global setting can't fit all of them exactly, so this applied the thickest "
+                       f"group's numbers (still safe for the thinner groups, just a little less tight): "
+                       f"part spacing {rec['part_spacing']:.2f} mm, margin {rec['margin']:.2f} mm, "
+                       f"microjoint tab width {rec['microjoint_tab_width']:.2f} mm.")
+
     def _microjoint_cfg(self):
         if not self.microjoints_enabled.isChecked():
             return None
@@ -2266,9 +3354,12 @@ class NestingPanel(QtWidgets.QWidget):
             self.sheet_label.setText("No sheets yet")
             self.sheet_pos_label.setText("Sheet -- of --")
             self.preview.set_sheet(self.sheet_w.value(), self.sheet_h.value(), [])
+            self.preview.set_hint("No layout yet -- press ▶ Run Nesting to see your sheets here.")
+            self.preview.set_caption("")
             self.part_selector.blockSignals(False)
             self._selected_part_idx = None
             self._refresh_sheet_selector()
+            self.sheet_shown.emit(-1)
             return
         idx = self.current_sheet_index
         sheet = self.sheets[idx]
@@ -2282,6 +3373,8 @@ class NestingPanel(QtWidgets.QWidget):
             f"{len(sheet)} parts, {util:.1f}% utilization"
         )
         self.preview.set_sheet(w, h, sheet, self._microjoint_cfg(), self._common_line_cfg())
+        self.preview.set_hint("")
+        self.preview.set_caption("\n".join(t for t in (job_label, f"{w:g} \u00d7 {h:g} mm") if t))
         self.sheet_pos_label.setText(f"Sheet {idx + 1} of {len(self.sheets)}")
         for i, pp in enumerate(sheet):
             marker = " (mirrored)" if pp.mirrored else ""
@@ -2291,6 +3384,7 @@ class NestingPanel(QtWidgets.QWidget):
         self._refresh_sheet_selector()
         if self.layout_list.count():
             self.layout_list.setCurrentRow(min(idx, self.layout_list.count() - 1))
+        self.sheet_shown.emit(idx)
 
     def _refresh_sheet_selector(self):
         """Rebuilds the sheet-jump dropdown to match self.sheets -- cheap
@@ -2359,6 +3453,13 @@ class NestingPanel(QtWidgets.QWidget):
                 # the user wants to adjust it, so surface the controls.
                 self.manual_toggle.setChecked(True)
 
+    def _on_measured(self, m):
+        if m is None:
+            return
+        (x1, y1), (x2, y2) = m["start"], m["end"]
+        self._log(f"Measure: {m['distance']:.2f} mm from ({x1:.2f}, {y1:.2f}) to ({x2:.2f}, {y2:.2f}) -- "
+                  f"ΔX {m['dx']:.2f}, ΔY {m['dy']:.2f}, angle {m['angle']:.1f}°")
+
     def _on_preview_coords(self, xy):
         if xy is None:
             self.coord_label.setText("X: --   Y: -- mm")
@@ -2421,6 +3522,17 @@ class NestingPanel(QtWidgets.QWidget):
     # -------------------------------------------------------------- export
 
     def _export_dxf(self):
+        """Export every sheet as DXF, grouped by material/thickness, plus a
+        release manifest. Any failure is reported in the log AND a dialog:
+        an exception escaping a button's slot only reaches the terminal, so
+        from inside the window a failed export looked like a dead button."""
+        try:
+            self._export_dxf_files()
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[error] DXF export failed: {e}")
+            QtWidgets.QMessageBox.critical(self, "Export DXF failed", f"The DXF export stopped with an error:\n\n{e}")
+
+    def _export_dxf_files(self):
         if not self.sheets:
             return
         if not self._require_preflight("export DXF", require_layout=True):
@@ -2433,9 +3545,16 @@ class NestingPanel(QtWidgets.QWidget):
         common_line = self.common_line_enabled.isChecked()
         if common_line and microjoint_cfg:
             self._log("[note] Common-line cutting doesn't combine with Microjoints -- Microjoints wins for this export.")
+        # A PlacedPart is geometry only -- material/thickness live on the
+        # Part it was placed from, so each placed copy is looked up by name
+        # among the parts this layout was nested from. (Reading them off the
+        # PlacedPart raised AttributeError, which Qt swallowed: pressing
+        # Export DXF did nothing at all.)
+        stock_of = {part.name: (part.material or "unspecified", float(part.thickness or 0.0))
+                    for part in (self._last_run_parts or self._table_parts())}
         grouped_sheets = {}
         for i, sheet in enumerate(self.sheets):
-            keys = {(pp.material, pp.thickness) for pp in sheet}
+            keys = {stock_of.get(pp.name, ("unspecified", 0.0)) for pp in sheet}
             if len(keys) != 1:
                 QtWidgets.QMessageBox.critical(self, "Export blocked", "A layout contains mixed material/thickness parts.")
                 return
@@ -2468,20 +3587,6 @@ class NestingPanel(QtWidgets.QWidget):
             writer.writerows(manifest_rows)
         self._log(f"Wrote strict release manifest: {manifest_path}")
         return
-
-        for i, sheet in enumerate(self.sheets):
-            if not sheet:
-                continue
-            w, h = self.sheet_dims[i]
-            job_label = self.sheet_job_label[i]
-            suffix = "_" + job_label.replace(" ", "").replace("/", "_") if job_label else ""
-            polys = [(pp.name.replace(" ", "_"), pp.points, pp.holes) for pp in sheet]
-            path = os.path.join(out_dir, f"sheet_{i + 1}{suffix}.dxf")
-            dxf_writer.write_dxf(path, polys, w, h, microjoints=microjoint_cfg, labels=label_cfg,
-                                  common_line_cutting=common_line)
-            extras = ", ".join(n for n, on in (("microjoints", microjoint_cfg), ("labels", label_cfg),
-                                                ("common-line cutting", common_line and not microjoint_cfg)) if on)
-            self._log(f"Wrote {path}" + (f" (with {extras})" if extras else ""))
 
     def _export_report(self):
         """A self-contained HTML nesting report -- job totals (sheets,
@@ -2592,6 +3697,71 @@ class NestingPanel(QtWidgets.QWidget):
             "net_cost": net_cost,
         }
 
+    def _part_thumbnail_b64(self, name, points, holes, size=140):
+        """Renders one part's own outer contour + holes (ignoring wherever
+        it actually landed/rotated on a sheet) as a small standalone PNG,
+        via the same SheetPreview painting code the per-sheet thumbnails
+        use -- so colors/holes/styling match exactly. The "sheet" here is
+        just the part's own bounding box plus a little padding, not a real
+        stock sheet."""
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        bbox_w, bbox_h = max(xs) - min(xs), max(ys) - min(ys)
+        pad = max(bbox_w, bbox_h, 1e-6) * 0.08
+        ox, oy = min(xs) - pad, min(ys) - pad
+        w, h = bbox_w + 2 * pad, bbox_h + 2 * pad
+        shifted_points = [(x - ox, y - oy) for x, y in points]
+        shifted_holes = [[(x - ox, y - oy) for x, y in hole] for hole in holes]
+        fake = nester.PlacedPart(name=name, points=shifted_points, holes=shifted_holes,
+                                  rotation=0.0, sheet_index=0, mirrored=False)
+        preview = SheetPreview()
+        preview.resize(size, size)
+        preview.set_sheet(w, h, [fake])
+        pix = preview.grab()
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QIODevice.WriteOnly)
+        pix.save(buf, "PNG")
+        return base64.b64encode(bytes(buf.data())).decode("ascii")
+
+    def _build_parts_section_html(self):
+        """One row per distinct part name: a representative-shape thumbnail
+        (from the run's own part definitions when available, so it's the
+        canonical unrotated shape, not whichever rotation happened to be
+        placed) and how many copies actually got nested this run -- as
+        opposed to self._last_run_parts' quantity, which is how many were
+        asked for and may be higher if some copies didn't fit."""
+        placed_counts = {}
+        for sheet in self.sheets:
+            for pp in sheet:
+                placed_counts[pp.name] = placed_counts.get(pp.name, 0) + 1
+
+        parts_by_name = {}
+        part_order = []
+        for p in (self._last_run_parts or []):
+            if p.name not in parts_by_name:
+                parts_by_name[p.name] = p
+                part_order.append(p.name)
+        for sheet in self.sheets:
+            for pp in sheet:
+                if pp.name not in parts_by_name:
+                    parts_by_name[pp.name] = pp
+                    part_order.append(pp.name)
+
+        rows = []
+        for name in part_order:
+            src = parts_by_name[name]
+            img_b64 = self._part_thumbnail_b64(name, src.points, src.holes)
+            rows.append(
+                f"<tr><td><img src='data:image/png;base64,{img_b64}' width='110'></td>"
+                f"<td>{name}</td><td>{placed_counts.get(name, 0)}</td></tr>"
+            )
+        return f"""
+<h2>Parts</h2>
+<table>
+<tr><th>Shape</th><th>Name</th><th>Nested</th></tr>
+{"".join(rows)}
+</table>"""
+
     def _build_report_html(self):
         """Shared HTML body for both the manual Export Report and the
         automatic post-run report. Reads self.sheets/sheet_dims/used_stock
@@ -2599,6 +3769,16 @@ class NestingPanel(QtWidgets.QWidget):
         preview per sheet plus a stock-consumption section."""
         microjoint_cfg = self._microjoint_cfg()
         common_line_cfg = self._common_line_cfg()
+        # Export-time-effective common-line: dxf_writer.py has Microjoints
+        # win when both are checked (see commonline.py's module docstring),
+        # so mirror that precedence here rather than reporting common-line
+        # as "on" when an actual export would skip it.
+        effective_common_line_cfg = common_line_cfg if microjoint_cfg is None else None
+        cutting_params = self._last_run_cutting_params or self._current_cutting_params()
+        margins = (cutting_params["margin_left"], cutting_params["margin_right"],
+                   cutting_params["margin_top"], cutting_params["margin_bottom"])
+        margin_text = f"{margins[0]:g} mm" if len(set(margins)) == 1 else \
+            f"L{margins[0]:g} R{margins[1]:g} T{margins[2]:g} B{margins[3]:g} mm"
         currency_symbol = CURRENCY_SYMBOLS.get(self.currency_code, "")
         rows = []
         for i, sheet in enumerate(self.sheets):
@@ -2626,10 +3806,26 @@ class NestingPanel(QtWidgets.QWidget):
 
             mirrored = sum(1 for pp in sheet if pp.mirrored)
             parts_text = str(len(sheet)) if not mirrored else f"{len(sheet)} ({mirrored} mirrored)"
+
+            # Per-sheet cutting-options note: what actually happens on THIS
+            # sheet's own geometry, not just whether the checkbox is on --
+            # microjoint tab count and common-line merged-edge count both
+            # depend on this sheet's specific layout.
+            if microjoint_cfg is not None:
+                segment_counts = [len(mj.add_tabs(pp.points, **microjoint_cfg)) for pp in sheet]
+                tabs = sum(n for n in segment_counts if n > 1)  # add_tabs() leaves a too-small part closed (1 segment, no gaps)
+                cutting_note = f"Microjoints ({microjoint_cfg['tab_width']:g}mm): {tabs} tab(s)"
+            elif effective_common_line_cfg is not None:
+                _shared, merged = commonline.find_shared_edges([pp.points for pp in sheet])
+                cutting_note = f"Common-line: {len(merged)} edge(s) merged" if merged else "Common-line: none merged"
+            else:
+                cutting_note = "none"
+
             rows.append(
                 f"<tr><td><img src='data:image/png;base64,{img_b64}' width='220'></td>"
                 f"<td>{i + 1}</td><td>{job_label}</td><td>{w:g} x {h:g} mm</td>"
-                f"<td>{parts_text}</td><td>{util:.1f}%</td><td>{price_text}</td></tr>"
+                f"<td>{parts_text}</td><td>{util:.1f}%</td><td>{price_text}</td>"
+                f"<td>{cutting_params['part_spacing']:g} mm</td><td>{margin_text}</td><td>{cutting_note}</td></tr>"
             )
 
         total_placed = sum(len(s) for s in self.sheets)
@@ -2723,11 +3919,13 @@ saved by not buying that weight of material new.</p>
   <li>Net material cost: {cost_text}</li>
   <li>Unplaced parts: {unplaced_text}</li>
 </ul>
+{self._build_parts_section_html()}
 {financials_section}
 {stock_section}
 <h2>Sheets</h2>
 <table>
-<tr><th>Layout</th><th>#</th><th>Material / Thickness</th><th>Size</th><th>Parts</th><th>Efficiency</th><th>Cost/Saved</th></tr>
+<tr><th>Layout</th><th>#</th><th>Material / Thickness</th><th>Size</th><th>Parts</th><th>Efficiency</th><th>Cost/Saved</th>
+<th>Part spacing</th><th>Margins</th><th>Cutting options</th></tr>
 {"".join(rows)}
 </table>
 </body></html>"""

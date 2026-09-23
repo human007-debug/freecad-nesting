@@ -106,3 +106,29 @@ def _clear_nfp_cache():
     nfp.clear_cache()
     yield
     nfp.clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _dispose_top_level_widgets():
+    """Delete every window a test leaves behind. `close()` only hides a
+    QMainWindow, and the app stylesheet is re-applied to every live widget
+    each time a window is built -- so windows left over from earlier tests
+    made each new one slower to build (seconds apiece by the end of a run).
+
+    deleteLater(), never close(): this runs after the test's own fixtures
+    are torn down -- including any monkeypatched settings location -- and a
+    MainWindow's closeEvent saves preferences, which would land in the
+    user's real settings file."""
+    yield
+    import sys
+
+    if "PySide6.QtWidgets" not in sys.modules:
+        return
+    from PySide6 import QtCore, QtWidgets
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    for widget in app.topLevelWidgets():
+        widget.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)

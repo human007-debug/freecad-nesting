@@ -83,6 +83,30 @@
       "price_per_kg": null,
       "density_g_cm3": 2.68,
       "scrap_price_per_kg": null
+    },
+    {
+      "material": "Mild Steel",
+      "thickness": 10.0,
+      "width": 1250.0,
+      "height": 3000.0,
+      "quantity": 100,
+      "is_remnant": false,
+      "id": null,
+      "price_per_kg": null,
+      "density_g_cm3": null,
+      "scrap_price_per_kg": null
+    },
+    {
+      "material": "Mild Steel",
+      "thickness": 16.0,
+      "width": 1250.0,
+      "height": 3000.0,
+      "quantity": 100,
+      "is_remnant": false,
+      "id": null,
+      "price_per_kg": null,
+      "density_g_cm3": null,
+      "scrap_price_per_kg": null
     }
   ]
 }

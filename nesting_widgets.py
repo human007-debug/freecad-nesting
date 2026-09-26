@@ -2517,14 +2517,14 @@ class NestingPanel(QtWidgets.QWidget):
         }
 
     def _save_job(self, path):
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(self._job_state(), f, indent=2)
         self._job_path = path
         self.job_path_changed.emit(path)
         self._log(f"Saved job to {path}.")
 
     def _load_job(self, path):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
 
         settings = data.get("settings", {})
@@ -3580,7 +3580,7 @@ class NestingPanel(QtWidgets.QWidget):
                 self._log(f"Wrote {path}")
 
         manifest_path = os.path.join(out_dir, "release_manifest.csv")
-        with open(manifest_path, "w", newline="") as manifest_file:
+        with open(manifest_path, "w", newline="", encoding="utf-8") as manifest_file:
             writer = csv.writer(manifest_file)
             writer.writerow(["release_group", "file", "material_grade", "thickness_mm", "sheet_width_mm",
                              "sheet_height_mm", "parts_placed", "sha256", "part_names"])
@@ -3931,7 +3931,7 @@ saved by not buying that weight of material new.</p>
 </body></html>"""
 
     def _write_report_file(self, path, html):
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(html)
         self._log(f"Wrote nesting report to {path}.")
 

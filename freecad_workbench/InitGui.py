@@ -1,66 +1,64 @@
 """
 InitGui.py
 ----------
-FreeCAD discovers a workbench by finding this file (InitGui.py) directly
-inside a folder under Mod/ -- specifically App.getUserAppDataDir()+"Mod"
-(which, confusingly, already includes the "v1-x" version segment -- e.g.
-~/.var/app/org.freecad.FreeCAD/data/FreeCAD/v1-1/Mod on this flatpak
-install, NOT the version-less .../FreeCAD/Mod one level up). This folder is
-meant to be symlinked there under the name "FreeCADNesting" -- see
-README.md's "Workbench UI" section for the one-line setup command -- so the
-actual source stays in the project repo, not copied into FreeCAD's Mod
-directory.
+FreeCAD discovers a workbench by finding InitGui.py inside a folder under
+its Mod directory (App.getUserAppDataDir()+"Mod", which already includes the
+"v1-x" version segment -- e.g. ~/.var/app/org.freecad.FreeCAD/data/FreeCAD/
+v1-1/Mod on the flatpak). This workbench lives in a subfolder of the repo,
+not at its root, so the WHOLE repo goes into Mod/ (a git clone, the Addon
+Manager, or a symlink -- any folder name works): the repo-root package.xml
+tells FreeCAD's loader to run freecad_workbench/InitGui.py from there. See
+README.md's "Install" section.
 
-FreeCAD's loader runs this file via exec(compile(...)), NOT import, so
-`__file__` is not defined here -- can't use the usual
-os.path.dirname(__file__) trick to find our own directory. Instead, look
-ourselves up by name in FreeCAD.__ModDirs__, which the loader populates
-(from that same Mod-directory scan) before running any InitGui.py.
+FreeCAD's loader runs this file via exec(compile(source, path, "exec")), NOT
+import, so `__file__` is not defined here. The path it passed to compile()
+is still on this code object, though, so that's where we find our own
+directory -- independent of what the Mod folder is called.
 
-The nesting engine (nester.py, geometry.py, dxf_writer.py) and the
+The nesting engine (nester.py, geometry.py, dxf_writer.py, ...) and the
 extraction script (freecad_extract.py, part_import.py) all live one level
-up, in the project root -- add that to sys.path so this workbench's command
+up, in the repo root -- add that to sys.path so this workbench's command
 modules can import them directly, no vendoring/duplication.
 
 nester.py hard-requires `pyclipper` (see nfp.py), which isn't part of
-FreeCAD's bundled Python -- it needs vendoring into <project root>/vendor
-the same way networkx is vendored for the SheetMetal workbench (see
-README.md). That vendor dir has to land on sys.path HERE, at workbench-
-load time, not later inside nesting_panel.py's own setup code: this file's
-Initialize() imports nesting_command, whose Activated() imports
-nesting_panel, whose own top-level `import nester` chain (nester -> nfp ->
-pyclipper) would already have failed by the time any of that module's own
-sys.path setup got a chance to run.
+FreeCAD's bundled Python. A pyclipper installed into FreeCAD's Python (the
+Addon Manager's AdditionalPythonPackages, or pip) always wins; <repo>/vendor
+is only a fallback, APPENDED to sys.path so it can never shadow a working
+install -- its compiled extension only matches Linux/Python 3.13 (the
+FreeCAD 1.1 flatpak), and on any other platform it would fail to load even
+when a correct copy was installed. This has to happen HERE, at workbench-
+load time: Initialize() imports nesting_command, whose Activated() imports
+nesting_panel, whose top-level `import nester` (-> nfp -> pyclipper) would
+already have failed before any later sys.path setup got a chance to run.
 """
 
+import inspect
 import os
 import sys
 
 import FreeCAD as App
 import FreeCADGui as Gui
 
-_WB_FOLDER_NAME = "FreeCADNesting"
-_WB_DIR = None
-for _d in getattr(App, "__ModDirs__", []):
-    if os.path.basename(os.path.normpath(_d)) == _WB_FOLDER_NAME:
-        _WB_DIR = os.path.realpath(_d)
-        break
-if _WB_DIR is None:
-    _f = globals().get("__file__")
-    if _f:
-        _WB_DIR = os.path.dirname(os.path.realpath(_f))
-    else:
-        raise RuntimeError(
-            f"NestingWorkbench: could not find a Mod/ entry named "
-            f"'{_WB_FOLDER_NAME}' in FreeCAD.__ModDirs__ -- is the symlink "
-            f"named exactly that? See README.md's 'Workbench UI' section."
-        )
-
+_WB_DIR = os.path.dirname(os.path.realpath(inspect.currentframe().f_code.co_filename))
 _PROJECT_ROOT = os.path.dirname(_WB_DIR)
-_VENDOR_DIR = os.path.join(_PROJECT_ROOT, "vendor")
-for _p in (_VENDOR_DIR, _PROJECT_ROOT, _WB_DIR):
-    if os.path.isdir(_p) and _p not in sys.path:
+for _p in (_PROJECT_ROOT, _WB_DIR):
+    if _p not in sys.path:
         sys.path.insert(0, _p)
+
+try:
+    import pyclipper  # noqa: F401
+except ImportError:
+    _VENDOR_DIR = os.path.join(_PROJECT_ROOT, "vendor")
+    if os.path.isdir(_VENDOR_DIR) and _VENDOR_DIR not in sys.path:
+        sys.path.append(_VENDOR_DIR)
+    try:
+        import pyclipper  # noqa: F401
+    except ImportError:
+        App.Console.PrintWarning(
+            "Nesting workbench: the 'pyclipper' package is missing from "
+            "FreeCAD's Python, so Run Nesting won't work yet. See the "
+            "'Install' section of this workbench's README.md.\n"
+        )
 
 
 class NestingWorkbench(Gui.Workbench):

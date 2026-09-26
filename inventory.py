@@ -387,14 +387,14 @@ def save_inventory_xlsx(path, stock: List[StockSheet]):
 
 
 def load_inventory_json(path) -> List[StockSheet]:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     return [StockSheet(**s) for s in data["stock"]]
 
 
 def save_inventory_json(path, stock: List[StockSheet]):
     payload = {"stock": [vars(s) for s in stock]}
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
@@ -822,7 +822,7 @@ def commit_job(parts: List[Part], inventory_path: str, kerf: float = 0.0,
     if log_path is None:
         log_path = inventory_path + ".log.jsonl"
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    with open(log_path, "a") as f:
+    with open(log_path, "a", encoding="utf-8") as f:
         for r in results:
             counts: Dict[str, List] = {}
             for s in r.sheet_stock:

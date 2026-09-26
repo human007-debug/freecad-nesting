@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 
 import FreeCAD as App
 import FreeCADGui as Gui
@@ -34,7 +35,7 @@ class SendToAlphaNestCommand:
     and the standalone native app: extract this document's SheetMetal parts
     with the same in-process extraction the Run Nesting dialog uses, write
     them to the parts.json shape the native app imports, and -- if the
-    project's run.sh is present -- launch that app with the file.
+    project's run.sh/run.bat is present -- launch that app with the file.
 
     This is a deliberate *file* handoff rather than live IPC between two
     running processes: the parts file is already the shared source of truth
@@ -89,13 +90,19 @@ class SendToAlphaNestCommand:
             "quantity": data.get("quantity", 1),
             "material": data.get("material"),
         } for label, data in extracted.items()]
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump({"parts": parts}, f, indent=2)
 
-        run_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "native_app", "run.sh")
-        if os.path.isfile(run_sh):
+        app_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "native_app")
+        if sys.platform == "win32":
+            launcher = os.path.join(app_dir, "run.bat")
+            launch_cmd = ["cmd", "/c", launcher, path]
+        else:
+            launcher = os.path.join(app_dir, "run.sh")
+            launch_cmd = ["bash", launcher, path]
+        if os.path.isfile(launcher):
             try:
-                subprocess.Popen(["bash", run_sh, path], start_new_session=True)
+                subprocess.Popen(launch_cmd, start_new_session=True)
                 return
             except Exception as e:  # noqa: BLE001
                 QtWidgets.QMessageBox.warning(

@@ -388,7 +388,7 @@ def main(argv=None):
             qty_note = f", merged from {p['quantity']} identical instances" if p.get("quantity", 1) > 1 else ""
             print(f"[ok] {name}: {len(p['outer'])} outer pts, {len(p['holes'])} hole(s){qty_note}")
 
-    with open(args.output, "w") as f:
+    with open(args.output, "w", encoding="utf-8") as f:
         json.dump({"parts": all_parts}, f, indent=2)
     print(f"Wrote {len(all_parts)} part(s) to {args.output}")
 

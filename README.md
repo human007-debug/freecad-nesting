@@ -10,6 +10,80 @@ works"), `pip install ezdxf` (DXF import — see "DXF/DWG import") and
 *export*, FreeCAD integration, the nesting engine itself) is still plain
 Python, no other third-party libraries.
 
+## Install
+
+AlphaNest comes two ways — use either or both. Both need the **whole
+repo**, not just one folder: the engine (`nester.py`, `geometry.py`, …)
+lives at the repo root and is shared by the app and the workbench.
+
+**Download:** `git clone https://github.com/human007-debug/freecad-nesting.git`,
+or on GitHub click **Code → Download ZIP** and unzip it.
+
+### Option A — standalone app (no FreeCAD needed for DXF)
+
+Needs Python 3.10+.
+
+```bash
+cd freecad-nesting
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt        # Windows: .venv\Scripts\pip install -r requirements.txt
+```
+
+Then start it with `native_app/run.sh` (Linux/macOS) or by double-clicking
+`native_app\run.bat` (Windows). Importing `.FCStd`/STEP/IGES files also
+needs FreeCAD installed. The app finds it automatically; if it can't, set
+`ALPHANEST_FREECADCMD` to the full path of `FreeCADCmd`/`freecadcmd`.
+
+### Option B — FreeCAD workbench
+
+**Yes, it goes in FreeCAD's `Mod` folder — the whole repo folder, under
+any name.** Don't copy only `freecad_workbench/`: it would be missing the
+engine. The `package.xml` at the repo root tells FreeCAD where the
+workbench is. Requires FreeCAD 1.0+ and the **SheetMetal** workbench
+(install it from the Addon Manager).
+
+1. Find your Mod folder. In FreeCAD's Python console
+   (View → Panels → Python console) run
+   `FreeCAD.getUserAppDataDir() + "Mod"`. Typical locations
+   (FreeCAD 1.0 has no `v1-1` segment):
+
+   | OS | Mod folder |
+   |---|---|
+   | Windows | `%APPDATA%\FreeCAD\v1-1\Mod` |
+   | macOS | `~/Library/Application Support/FreeCAD/v1-1/Mod` |
+   | Linux | `~/.local/share/FreeCAD/v1-1/Mod` |
+   | Linux (flatpak) | `~/.var/app/org.freecad.FreeCAD/data/FreeCAD/v1-1/Mod` |
+
+   Create the `Mod` folder if it doesn't exist yet.
+2. Put the repo there: `git clone https://github.com/human007-debug/freecad-nesting.git`
+   inside `Mod`, or move the unzipped folder in. If you'd rather keep your
+   checkout somewhere else, a symlink works too:
+   `ln -s /path/to/freecad-nesting <Mod folder>/freecad-nesting`.
+3. Install `pyclipper` (and `networkx`, which SheetMetal's unfolder needs)
+   into FreeCAD's own Python. Paste this into FreeCAD's Python console:
+
+   ```python
+   import os, platform, subprocess, FreeCAD, freecad.utils
+   v = platform.python_version_tuple()
+   target = os.path.join(FreeCAD.getUserAppDataDir(), "AdditionalPythonPackages", f"py{v[0]}{v[1]}")
+   subprocess.run([freecad.utils.get_python_exe(), "-m", "pip", "install", "--target", target, "pyclipper", "networkx"], check=True)
+   ```
+
+   On the Linux flatpak (FreeCAD 1.1) you can skip this step: the repo's
+   `vendor/` folder already has copies built for it.
+4. Restart FreeCAD and pick **Nesting** from the workbench dropdown.
+
+Alternatively, let the Addon Manager do steps 2–3: Edit → Preferences →
+Addon Manager → Custom repositories → add
+`https://github.com/human007-debug/freecad-nesting` (branch `master`),
+then install **AlphaNest** from the Addon Manager. If it doesn't offer to
+install `pyclipper` for you, run step 3 by hand.
+
+**Workbench missing, or Run Nesting does nothing?** Check View → Panels →
+Report view. A `pyclipper` warning there means step 3 hasn't been done.
+If `InitGui.py not found` shows up in the log, the folder in `Mod` is
+`freecad_workbench` itself instead of the whole repo.
+
 ## Status (updated after step 1 & 2)
 
 **Step 1 — hole support: done.** `Part`/`PlacedPart` now carry an outer
@@ -1529,15 +1603,13 @@ preview never lands on a different ordering than what was shown.
 
 ### Installing it
 
-FreeCAD discovers a workbench by finding an `InitGui.py` directly inside a
-folder under its Mod directory. Symlink this folder in under the exact name
-`FreeCADNesting` (the code looks itself up by that name — see the "gotcha"
-below) so the actual source stays in this repo, not copied into FreeCAD's
-data directory:
-```bash
-ln -s "$(pwd)/freecad_workbench" \
-    ~/.var/app/org.freecad.FreeCAD/data/FreeCAD/v1-1/Mod/FreeCADNesting   # flatpak; adjust for a non-flatpak install / FreeCAD version
-```
+See [Install → Option B](#option-b--freecad-workbench) at the top of this
+file. In short: put the whole repo (any folder name, or a symlink to it) in
+FreeCAD's Mod folder. The repo-root `package.xml` points FreeCAD's loader at
+`freecad_workbench/InitGui.py`, which finds its own location from the path
+FreeCAD compiled it with. The older setup, a symlink named `FreeCADNesting`
+pointing straight at `freecad_workbench/`, still works too.
+
 Restart FreeCAD, pick "Nesting" from the workbench dropdown, open or create
 a document with some SheetMetal-workbench parts in it, and run
 "Nesting → Run Nesting...".
@@ -1562,8 +1634,9 @@ anything else, including a malformed hand-written XPM `Icon` string that
 made `Gui.addWorkbench()` throw) is caught by FreeCAD's loader and *fully
 swallowed*: the workbench just doesn't appear, with nothing printed to the
 terminal or the GUI. `InitGui.py` here works around the first issue by
-looking itself up in `FreeCAD.__ModDirs__` by directory name instead of
-using `__file__`; the second was found by manually
+reading its own path off its code object
+(`inspect.currentframe().f_code.co_filename`, the filename FreeCAD passed to
+`compile()`) instead of using `__file__`; the second was found by manually
 `exec()`-ing the file the same way FreeCAD's loader does, from a script, to
 surface the real traceback.
 
@@ -1574,9 +1647,12 @@ workbench-*load* time, not inside `nesting_panel.py`'s own setup code —
 `Initialize()` imports `nesting_command`, whose `Activated()` imports
 `nesting_panel`, whose own top-level `import nester` (→ `nfp` →
 `pyclipper`) already runs, and already fails, before that module's own
-`sys.path` fixup ever gets a turn. `InitGui.py` adds `<project root>/vendor`
-to `sys.path` itself, before anything downstream gets imported, for
-exactly this reason. Symptom when this is wrong: clicking "Run Nesting..."
+`sys.path` fixup ever gets a turn. `InitGui.py` makes `pyclipper`
+importable itself, before anything downstream gets imported, for exactly
+this reason. It uses FreeCAD's own copy if one is installed, and otherwise
+*appends* `<project root>/vendor`. Appending means the vendored copy never
+shadows a working install: its compiled extension only loads on
+Linux/Python 3.13. Symptom when this is wrong: clicking "Run Nesting..."
 does nothing at all — no dialog, no visible error — because the `import
 nester` chain fails inside `Activated()` before `NestingDialog` is ever
 constructed; check the Report View for `ModuleNotFoundError`.

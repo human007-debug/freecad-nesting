@@ -108,5 +108,5 @@ def write_dxf(path, parts, sheet_w=None, sheet_h=None, microjoints=None, labels=
 
     lines += ["0", "ENDSEC", "0", "EOF"]
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")

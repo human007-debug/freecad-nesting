@@ -129,9 +129,13 @@ def _default_vendor_dir():
 
 
 def _setup_paths(sheetmetal_dir, vendor_dir):
-    for d in (vendor_dir, sheetmetal_dir):
-        if d and d not in sys.path:
-            sys.path.insert(0, d)
+    if sheetmetal_dir and sheetmetal_dir not in sys.path:
+        sys.path.insert(0, sheetmetal_dir)
+    # Appended, not prepended: vendor/ is a fallback for a FreeCAD Python
+    # with no networkx/pyclipper of its own, and its compiled pyclipper only
+    # loads on Linux/Python 3.13 -- it must never shadow a working install.
+    if vendor_dir and vendor_dir not in sys.path:
+        sys.path.append(vendor_dir)
 
 
 # ------------------------------------------------------------- discovery
@@ -669,7 +673,7 @@ def main(argv):
                 print(f"[merge] {part['name']}: {len(part['instances'])} identical instances "
                       f"({', '.join(part['instances'])}) -> quantity {part['quantity']}")
 
-    with open(args.output, "w") as f:
+    with open(args.output, "w", encoding="utf-8") as f:
         json.dump({"parts": all_parts, "unresolved": all_unresolved, "skipped": all_skipped}, f, indent=2)
     extra = []
     if all_unresolved:

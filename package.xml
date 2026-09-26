@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<!--
+  FreeCAD addon metadata. With this file at the repo root, the WHOLE repo can
+  sit in FreeCAD's Mod folder (git clone, Addon Manager, or a symlink, under
+  any folder name): FreeCAD reads this file and runs the workbench from the
+  freecad_workbench/ subdirectory named below.
+-->
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>AlphaNest</name>
+  <description>True-shape sheet-metal nesting: nests SheetMetal, STEP/IGES and DXF parts onto stock sheets and exports cut-ready DXF.</description>
+  <version>0.9.0</version>
+  <date>2026-09-26</date>
+  <maintainer email="daksshinganesh@gmail.com">Daksshin G</maintainer>
+  <url type="repository" branch="master">https://github.com/human007-debug/freecad-nesting</url>
+  <url type="readme">https://github.com/human007-debug/freecad-nesting/blob/master/README.md</url>
+  <icon>alphanest-icon-pack/logo/mark-only.svg</icon>
+
+  <content>
+    <workbench>
+      <name>Nesting</name>
+      <classname>NestingWorkbench</classname>
+      <subdirectory>./freecad_workbench</subdirectory>
+      <icon>../alphanest-icon-pack/logo/mark-only.svg</icon>
+      <freecadmin>1.0.0</freecadmin>
+      <depend type="addon">SheetMetal</depend>
+      <depend type="python">pyclipper</depend>
+      <depend type="python">networkx</depend>
+      <depend type="python" optional="true">ezdxf</depend>
+      <depend type="python" optional="true">openpyxl</depend>
+      <tag>nesting</tag>
+      <tag>sheet metal</tag>
+      <tag>laser cutting</tag>
+      <tag>CAM</tag>
+    </workbench>
+  </content>
+</package>

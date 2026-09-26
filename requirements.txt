@@ -1,0 +1,6 @@
+# Standalone AlphaNest app (python native_app/main.py). The FreeCAD workbench
+# doesn't use this file -- see README "Install".
+PySide6>=6.5
+pyclipper>=1.3
+ezdxf>=1.1
+openpyxl>=3.1

@@ -20,7 +20,7 @@ def load_parts(json_path, rotations=None):
     """rotations: optional override list applied to every loaded part
     (freecad_extract.py doesn't know a part's allowed rotations -- that's
     a shop-floor decision, not something derivable from the CAD geometry)."""
-    with open(json_path) as f:
+    with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
 
     parts = []

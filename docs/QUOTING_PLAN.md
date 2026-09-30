@@ -2,7 +2,24 @@
 
 A plan for a quoting module modelled on Hexagon RADAN Radquote, built on
 top of the AlphaNest nesting engine and its FreeCAD integration. Status:
-**plan only — nothing implemented yet.**
+**Phases 1–3 implemented** as the pure-Python `quoting/` package plus
+`bar_nest.py` (tests: `tests/test_quoting_*.py`, `tests/test_bar_nest.py`).
+Phases 4–6 are not started. See "Implementation status" below.
+
+## Implementation status
+
+| Plan item | Where | Notes |
+|---|---|---|
+| Phase 1 part features | `quoting/features.py` | One `PartFeatures` schema for extractor JSON, DXF/`nester.Part` and hand entry. Bends `None` = unknown (DXF/STEP) and are flagged on the quote rather than costed as zero. |
+| Phase 1 extractor | `freecad_extract.py` (`quoting_features()`) | Adds `bend_details` and `hole_features` to each part, read from the folded solid's cylinder/cone faces; threads from upstream `PartDesign::Hole` features. Needs FreeCAD, so it has no automated test here. |
+| Phase 2 rates | `quoting/rates.py` | Rows per material/thickness (etc.) with interpolation; refuses to extrapolate. SQLite and XLSX I/O. Starter rates are all `calibrated=False`. |
+| Phase 2 operations | `quoting/operations.py` | `Operation` base class, laser, press brake, `RuleOperation` (flat / per part / kg / m² / m) and `painting()`. |
+| 2b.1 classify | `quoting/classify.py` | Works on a plain `SolidInfo` record. The FreeCAD side that fills `SolidInfo` from a document is Phase 4 work. |
+| 2b.2 welding | `quoting/ops_weld.py` | `joints_from_contacts()` takes plain contact records; finding contact edges in FreeCAD is Phase 4 work. |
+| 2b.3 tube | `quoting/ops_tube.py`, `bar_nest.py` | Saw or tube laser, end-cut multipliers; bar stock is `bar_nest.BarStock` rather than a new `inventory.py` column. |
+| 2b.4 machining | `quoting/ops_machining.py` | Per-feature, flagged `estimate`. |
+| 2b.5/2b.6 | `quoting/ops_assembly.py`, `RuleOperation` | Assembly labour, bought-in lines, quote-level costs. |
+| Phase 3 costing | `quoting/costing.py` | Real nest per break via `inventory.run_job()` (on a copy of the stock), or a quick utilisation estimate; net-area / bbox allocation; remnant factor; scrap credit; per-area markup; overrides that keep the calculated value. Machined parts take a hand-entered `blank_cost` for material. |
 
 ## 1. What Radquote does (research summary)
 

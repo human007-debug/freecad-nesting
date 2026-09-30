@@ -23,7 +23,10 @@ For each .FCStd file given, it:
   4. Tessellates every wire (arcs/circles included) into a straight-edge
      polygon -- `nester.py`'s geometry only understands straight edges --
      and writes {name, points, holes, thickness, quantity, ...} for every
-     part found to a JSON file.
+     part found to a JSON file -- plus, for the quoting module,
+     `bend_details` (angle/length/radius per bend) and `hole_features`
+     (round holes by diameter and kind), read off the folded solid (see
+     `quoting_features()`).
 
 A .step/.stp/.iges/.igs path is also accepted (imported into a fresh
 document via `Part.insert`, which works headless under FreeCADCmd -- no
@@ -422,6 +425,151 @@ def extract_plain_part(obj, tol):
     }
 
 
+# ------------------------------------------- quoting features (bends, holes)
+#
+# Extra per-part facts for the quoting module (quoting/features.py reads
+# them; docs/QUOTING_PLAN.md Phase 1). Read off the part's FOLDED solid by
+# plain BRep inspection rather than from the unfolder's internal bend
+# records, so the same code works for SheetMetal parts, flat plates and
+# plain STEP solids alike. Best effort: any failure leaves the lists empty
+# and never blocks extraction -- the nesting output is what matters here.
+
+_FULL_TURN = 2 * math.pi - 1e-3
+
+
+def _axis_key(surface, ndigits=2):
+    """Identity of a cylinder/cone's axis LINE: its direction (sign-
+    normalised) plus the point on it closest to the origin."""
+    d = App.Vector(surface.Axis).normalize()
+    comps = (d.x, d.y, d.z)
+    first = next(c for c in comps if abs(c) > 1e-9)
+    if first < 0:
+        d = d * -1
+    c = App.Vector(surface.Center if hasattr(surface, "Center") else surface.Apex)
+    foot = c - d * c.dot(d)
+    return (round(d.x, 4), round(d.y, 4), round(d.z, 4),
+            round(foot.x, ndigits), round(foot.y, ndigits), round(foot.z, ndigits))
+
+
+def _cylinder_groups(shape):
+    """{axis key: [(radius, angular span rad, axial length, face)]}"""
+    groups = {}
+    for f in shape.Faces:
+        if f.Surface.TypeId != "Part::GeomCylinder":
+            continue
+        u0, u1, v0, v1 = f.ParameterRange
+        groups.setdefault(_axis_key(f.Surface), []).append((f.Surface.Radius, u1 - u0, abs(v1 - v0), f))
+    return groups
+
+
+def bend_details(shape):
+    """One {angle_deg, length, radius, direction} per bend: a set of
+    coaxial PARTIAL cylinder faces (a bend's inside and outside skins; the
+    inside -- smallest radius -- gives radius and angle, and its faces'
+    axial lengths sum to the bend length, so a bend interrupted by a relief
+    still counts once). Direction isn't recoverable from the folded solid
+    alone and is left None."""
+    bends = []
+    for faces in _cylinder_groups(shape).values():
+        r_in = min(r for r, _, _, _ in faces)
+        inner = [(span, length) for r, span, length, _ in faces if abs(r - r_in) < 1e-6]
+        if sum(span for span, _ in inner) >= _FULL_TURN:
+            continue  # a full turn is a hole or a boss, not a bend
+        bends.append({
+            "angle_deg": round(math.degrees(max(span for span, _ in inner)), 3),
+            "length": round(sum(length for _, length in inner), 3),
+            "radius": round(r_in, 3),
+            "direction": None,
+        })
+    return bends
+
+
+def _threaded_hole_sizes(obj):
+    """{diameter: thread size} from PartDesign::Hole features upstream of
+    `obj` that are marked Threaded -- threads are cosmetic in the BRep, so
+    only the feature's own properties say a hole is tapped."""
+    sizes = {}
+    try:
+        deps = list(getattr(obj, "OutListRecursive", [])) + [obj]
+    except Exception:  # noqa: BLE001
+        deps = [obj]
+    for dep in deps:
+        if getattr(dep, "TypeId", "") != "PartDesign::Hole" or not getattr(dep, "Threaded", False):
+            continue
+        dia = getattr(dep, "Diameter", None)
+        dia = getattr(dia, "Value", dia)
+        if dia:
+            sizes[round(float(dia), 2)] = str(getattr(dep, "ThreadSize", "") or "") or None
+    return sizes
+
+
+def hole_features(shape, obj=None):
+    """Round holes grouped by (diameter, kind): coaxial cylinder faces that
+    make a full turn and whose axis runs through empty space (a hole, not a
+    round boss or bar). A coaxial cone makes it a countersink; a larger
+    coaxial full cylinder a counterbore (the bore is not counted again);
+    a PartDesign::Hole marked Threaded with that diameter makes it tapped."""
+    threaded = _threaded_hole_sizes(obj) if obj is not None else {}
+    cones = set()
+    for f in shape.Faces:
+        if f.Surface.TypeId == "Part::GeomCone":
+            try:
+                cones.add(_axis_key(f.Surface))
+            except Exception:  # noqa: BLE001
+                pass
+    counted = {}
+    for key, faces in _cylinder_groups(shape).items():
+        by_r = {}
+        for r, span, length, f in faces:
+            by_r.setdefault(round(r, 3), []).append((span, length, f))
+        full = []
+        for r, parts in sorted(by_r.items()):
+            if sum(span for span, _, _ in parts) < _FULL_TURN:
+                continue
+            f = parts[0][2]
+            try:
+                # The axis point level with the face's middle: empty for a
+                # hole, inside material for a boss or a round bar.
+                c, d = App.Vector(f.Surface.Center), App.Vector(f.Surface.Axis).normalize()
+                probe = c + d * (App.Vector(f.CenterOfMass) - c).dot(d)
+                if shape.isInside(probe, 1e-3, True):
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            full.append((r, max(length for _, length, _ in parts)))
+        if not full:
+            continue
+        r, depth = full[0]
+        dia = round(2 * r, 2)
+        if len(full) > 1:
+            kind = "counterbore"
+        elif key in cones:
+            kind = "countersink"
+        elif dia in threaded:
+            kind = "tapped"
+        else:
+            kind = "plain"
+        thread = threaded.get(dia) if kind == "tapped" else None
+        k = (dia, kind, thread)
+        counted[k] = counted.get(k, 0) + 1
+    return [{"diameter": d, "kind": kind, "thread": thread, "depth": None, "count": n}
+            for (d, kind, thread), n in sorted(counted.items(), key=lambda kv: (kv[0][0], kv[0][1]))]
+
+
+def quoting_features(obj):
+    """{"bend_details": [...], "hole_features": [...]} for `obj`'s solid."""
+    out = {"bend_details": [], "hole_features": []}
+    try:
+        out["bend_details"] = bend_details(obj.Shape)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] {obj.Label}: bend details unavailable ({e})", file=sys.stderr)
+    try:
+        out["hole_features"] = hole_features(obj.Shape, obj)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] {obj.Label}: hole features unavailable ({e})", file=sys.stderr)
+    return out
+
+
 # --------------------------------------------------- duplicate instances
 
 def _polygon_area(points):
@@ -616,6 +764,7 @@ def main(argv):
                     "source": file_kind,
                     "quantity": qty,
                     "material": material,
+                    **quoting_features(final_obj),
                 })
                 print(f"[ok] {label}: {len(extracted['outer'])} outer pts, "
                       f"{len(extracted['holes'])} hole(s), method={extracted['method']}, "
@@ -657,6 +806,7 @@ def main(argv):
                     "source": file_kind,
                     "quantity": qty,
                     "material": material,
+                    **quoting_features(obj),
                 })
                 print(f"[ok] {label}: {len(extracted['outer'])} outer pts, "
                       f"{len(extracted['holes'])} hole(s), method={extracted['method']}, "

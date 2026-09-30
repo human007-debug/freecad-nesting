@@ -151,7 +151,7 @@ def test_price_quote_end_to_end(window):
     one, twenty = res.at(1), res.at(20)
     assert one.line("Bracket").cells["bending"].value is not None
     assert twenty.set_price < one.set_price
-    assert "No stock loaded" in qp.notes.toPlainText()             # fallback sheets used
+    assert "No sheet stock loaded" in qp.notes.toPlainText()             # fallback sheets used
     assert one.complete
 
 
@@ -162,7 +162,7 @@ def test_loaded_stock_is_used_instead_of_the_fallback(window):
     window.panel._inventory_template = [StockSheet("mild steel", 3.0, 1000, 500, price_per_kg=2.0,
                                                    density_g_cm3=7.85)]
     res = _price(qp)
-    assert "No stock loaded" not in qp.notes.toPlainText()
+    assert "No sheet stock loaded" not in qp.notes.toPlainText()
     sheet_kg = 1000 * 500 * 3 * 7.85 / 1e6
     b = res.at(1)
     total = 2 * b.line("Bracket").cells[MATERIAL].value + b.line("Plate").cells[MATERIAL].value

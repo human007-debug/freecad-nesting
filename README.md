@@ -30,7 +30,13 @@ python3 -m venv .venv
 ```
 
 Then start it with `native_app/run.sh` (Linux/macOS) or by double-clicking
-`native_app\run.bat` (Windows). Importing `.FCStd`/STEP/IGES files also
+`native_app\run.bat` (Windows). The quoting app, AlphaQuote, starts the
+same way from `quote_app/` (see "AlphaQuote"). Under WSL both `run.sh`
+launchers use X11 (`QT_QPA_PLATFORM=xcb`), which needs Qt's X11 libraries:
+`sudo apt install libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4
+libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0
+libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libxcb-xfixes0 libegl1 libgl1
+libfontconfig1 libdbus-1-3`. Importing `.FCStd`/STEP/IGES files also
 needs FreeCAD installed. The app finds it automatically; if it can't, set
 `ALPHANEST_FREECADCMD` to the full path of `FreeCADCmd`/`freecadcmd`.
 
@@ -1190,6 +1196,8 @@ normal and `mono` form. Suite: 126 tests.
 | `remnant.py`          | Pure geometry: largest empty rectangle left on a cut sheet, for automatic remnant capture |
 | `commonline.py`       | Pure geometry: detects/splits exact shared edges between placed parts, for common-line cutting |
 | `native_app/quote_panel.py` | The native app's Quote tab: quote lines, settings, per-quantity cost breakdown with overrides, XLSX export — see "Quoting (Quote tab)" |
+| `quote_app/`          | AlphaQuote, the standalone quoting app: quote list, customers, revisions, status, hand-offs to/from AlphaNest (`quote_app/run.sh` / `run.bat`) — see "AlphaQuote" |
+| `quoting/db.py`, `quoting/quote_model.py` | AlphaQuote's SQLite store (customers, quotes, revisions) and the Qt-free editable quote model both apps share |
 | `quote_demo.py`       | Example: quotes a small welded frame at 1/10/100 sets with the `quoting/` engine and prints the breakdown (`python3 quote_demo.py`) |
 | `bar_nest.py`         | Plain python3: 1D bar/tube/section length nesting (first-fit decreasing + local improvement, kerf and trim ends, remnants) |
 | `quoting/`            | Plain python3, no FreeCAD: AlphaQuote's quoting core — part features, part-type classification, rate tables (SQLite/XLSX), cost-centre operations and the quantity-break quote engine. See `docs/QUOTING_PLAN.md` |
@@ -1661,10 +1669,48 @@ does nothing at all — no dialog, no visible error — because the `import
 nester` chain fails inside `Activated()` before `NestingDialog` is ever
 constructed; check the Report View for `ModuleNotFoundError`.
 
-## Quoting (Quote tab)
+## AlphaQuote (the quoting app)
 
-The native app's **Quote** tab (`native_app/quote_panel.py`) prices the
-job with the `quoting/` engine — see `docs/QUOTING_PLAN.md`.
+AlphaQuote is the estimator's app, separate from AlphaNest the way RADAN
+Radquote is separate from RADAN's nesting. It is the same repo and the
+same engine (`quoting/`), with its own window and its own database of
+customers and quotes. Start it with `quote_app/run.sh` (Linux/macOS/WSL)
+or by double-clicking `quote_app\run.bat` (Windows), using the same
+`.venv` as AlphaNest.
+
+* **Quote list** (left): every quote, newest first. Search by number,
+  title or customer; filter by status; show only the latest revision of
+  each. The Value column is the price at the first quantity, as last
+  priced.
+* **The open quote** (right): number and revision, customer (type a new
+  name to add one), title, and the quote editor described under "Quote
+  tab" below. **Add Parts** imports DXF, parts JSON or FreeCAD/STEP files
+  straight into the quote; AlphaNest doesn't need to be open.
+* **Saving** is automatic: a moment after each change, when you switch
+  quotes, and on close.
+* **New revision** copies the quote into the next revision as a draft
+  and leaves the earlier revision as it was sent. **Duplicate** starts a
+  new quote number from this one.
+* **Status**: Mark sent / won / lost. Marking a quote won asks which
+  quantity was ordered.
+* **Send to AlphaNest** writes that many sets of the quote's sheet parts
+  as a `parts.json` (next to the database, in `to-alphanest/`) and opens
+  AlphaNest on it, ready to nest.
+* **Setup** tab: sheet stock (the same `.xlsx` AlphaNest uses), rates
+  (load, export, back to the starter rates), customers, currency, dark
+  mode. These are remembered between sessions.
+
+The database is one SQLite file: `~/.local/share/AlphaQuote/quotes.db` on
+Linux/WSL, `%APPDATA%\AlphaQuote\quotes.db` on Windows, or wherever
+`ALPHAQUOTE_DB` points. Use `quote_app/main.py --db PATH` to open a
+different one. Back up that file to back up every quote.
+
+## Quote tab (in AlphaNest)
+
+AlphaNest's **Quote** tab (`native_app/quote_panel.py`) prices the
+job it has open with the same editor. **Send to AlphaQuote** on that tab
+saves it into AlphaQuote's database as a new draft and opens it there —
+see `docs/QUOTING_PLAN.md`.
 
 1. Add parts on the **Parts** tab as usual; each becomes a sheet line on
    the Quote tab (FreeCAD imports bring their bend count and tapped holes

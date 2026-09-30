@@ -710,6 +710,10 @@ class MainWindow(QtWidgets.QMainWindow):
         export_quote_btn.setToolTip("Save the quote -- summary and breakdown per quantity -- to .xlsx.")
         export_quote_btn.clicked.connect(lambda: qp.export_xlsx())
         qp.busy_changed.connect(lambda busy: price_btn.setEnabled(not busy))
+        to_quote_btn = quote_run.add_large("commit-inventory", "\u27a1", "Send to\nAlphaQuote")
+        to_quote_btn.setToolTip("Save this quote into AlphaQuote's database as a new draft and open it "
+                                "there -- to add a customer, keep revisions and track it to won/lost.")
+        to_quote_btn.clicked.connect(lambda: self._send_to_alphaquote())
 
         # ---------------------------------------------------------- View
         view = ribbon.add_tab("View")
@@ -815,6 +819,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("quote_export_rates", "Export rates", export_rates_btn),
             ("quote_price", "Price quote", price_btn),
             ("quote_export", "Export quote", export_quote_btn),
+            ("quote_to_alphaquote", "Send to AlphaQuote", to_quote_btn),
         ]
         self.ribbon_items = items
 
@@ -1145,6 +1150,40 @@ class MainWindow(QtWidgets.QMainWindow):
         for panel in (self.parts_panel, self.stock_panel):
             if hasattr(panel, "on_theme_changed"):
                 panel.on_theme_changed()
+
+    # --------------------------------------------------------------- quote
+
+    def _send_to_alphaquote(self, db_path=None, launcher=None):
+        """The Quote tab's lines and settings as a new draft in AlphaQuote's
+        database (quoting/db.py), then AlphaQuote opened on it. Returns the
+        new quote's record."""
+        from quote_app import launch
+        from quoting.db import QuoteDB, default_db_path
+        qp = self.quote_panel
+        if not qp.lines:
+            QtWidgets.QMessageBox.information(self, "AlphaNest", "Nothing to send -- the quote has no lines.")
+            return None
+        state = qp.get_state()
+        for line in state["lines"]:
+            line["from_parts"] = False   # AlphaQuote owns them from here on
+        job = self.panel._job_path
+        title = os.path.splitext(os.path.basename(job))[0] if job else "From AlphaNest"
+        db = QuoteDB(db_path or default_db_path())
+        try:
+            rec = db.new_quote(title=title, data=state)
+            if qp.result is not None:
+                rec.summary = qp.priced_summary()
+                db.save_quote(rec)
+        finally:
+            db.close()
+        try:
+            (launcher or launch.launch_alphaquote)("--open", rec.id)
+        except Exception as e:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(self, "AlphaNest", f"Saved as {rec.label}, but AlphaQuote didn't "
+                                                            f"start:\n{e}")
+            return rec
+        self.statusBar().showMessage(f"Sent to AlphaQuote as {rec.label}.", 5000)
+        return rec
 
     # --------------------------------------------------------------- other
 

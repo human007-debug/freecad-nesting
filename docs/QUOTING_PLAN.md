@@ -4,11 +4,13 @@ A plan for a quoting module modelled on Hexagon RADAN Radquote, built on
 top of the AlphaNest nesting engine and its FreeCAD integration. Status:
 **Phases 1–3 implemented** as the pure-Python `quoting/` package plus
 `bar_nest.py` (tests: `tests/test_quoting_*.py`, `tests/test_bar_nest.py`).
-Phase 4 is partly done: the native app has a Quote tab
-(`native_app/quote_panel.py`). The quote database, customers and
-revisions, assembly expansion from a FreeCAD document, and the FreeCAD
-workbench button are not started; nor are Phases 5–6 (beyond an XLSX
-export). See "Implementation status" below.
+Phase 4 is mostly done, as a separate app: **AlphaQuote**
+(`quote_app/`), with its own quote database (`quoting/db.py`), plus a
+Quote tab in AlphaNest. Both use the same editor
+(`native_app/quote_panel.py`) and hand off to each other. Still open:
+expanding a FreeCAD assembly document into lines, and the workbench's
+"Quote this document" button. Phases 5–6 are not started, beyond an XLSX
+export. See "Implementation status" below.
 
 ## Implementation status
 
@@ -23,7 +25,8 @@ export). See "Implementation status" below.
 | 2b.3 tube | `quoting/ops_tube.py`, `bar_nest.py` | Saw or tube laser, end-cut multipliers; bar stock is `bar_nest.BarStock` rather than a new `inventory.py` column. |
 | 2b.4 machining | `quoting/ops_machining.py` | Per-feature, flagged `estimate`. |
 | 2b.5/2b.6 | `quoting/ops_assembly.py`, `RuleOperation` | Assembly labour, bought-in lines, quote-level costs. |
-| Phase 4 Quote tab | `native_app/quote_panel.py` | Lines from the Parts tab plus bought-in, tube and assembly lines; quantity breaks, markups, rates load/export; editable breakdown grid (overrides per quantity); XLSX export. Pricing runs on a worker thread. Quotes aren't saved yet (no database). |
+| Phase 4 AlphaQuote app | `quote_app/`, `quoting/db.py`, `quoting/quote_model.py` | Separate app (Radquote-style): quote list with search and status filter, customers, numbered quotes with revisions, draft/sent/won/lost with the won quantity, autosave to SQLite. Parts are imported directly from DXF, JSON or FreeCAD files. Send to AlphaNest writes the won quantity's sheet parts as parts.json and opens AlphaNest. AlphaNest's Quote tab has Send to AlphaQuote. |
+| Phase 4 Quote tab | `native_app/quote_panel.py` | Lines from the Parts tab plus bought-in, tube and assembly lines; quantity breaks, markups, rates load/export; editable breakdown grid (overrides per quantity); XLSX export. Pricing runs on a worker thread. Quotes are kept by sending them to AlphaQuote. |
 | Phase 3 costing | `quoting/costing.py` | Real nest per break via `inventory.run_job()` (on a copy of the stock), or a quick utilisation estimate; net-area / bbox allocation; remnant factor; scrap credit; per-area markup; overrides that keep the calculated value. Machined parts take a hand-entered `blank_cost` for material. |
 
 ## 1. What Radquote does (research summary)

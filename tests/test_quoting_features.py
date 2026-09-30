@@ -154,7 +154,7 @@ def test_quoting_core_imports_without_freecad():
         "sys.modules['FreeCAD'] = None; sys.modules['Part'] = None; sys.modules['FreeCADGui'] = None\n"
         "import bar_nest\n"
         "from quoting import features, classify, rates, operations, ops_weld, ops_tube, "
-        "ops_machining, ops_assembly, costing\n"
+        "ops_machining, ops_assembly, costing, quote_model, db\n"
         "print('ok')\n"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,

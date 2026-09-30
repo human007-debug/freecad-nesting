@@ -1,6 +1,6 @@
 #!/bin/bash
-# Launches the native nesting app from any working directory -- lets a
-# .desktop launcher (or a plain double-click) start it without a terminal.
+# Launches AlphaQuote from any working directory -- lets a .desktop
+# launcher (or a plain double-click) start it without a terminal.
 # Uses the project's .venv when there is one, else whatever python3 is on PATH.
 cd "$(dirname "$(readlink -f "$0")")/.." || exit 1
 # Under WSL, Qt's Wayland backend can crash with "Protocol error" when panes
@@ -9,6 +9,6 @@ if [ -z "$QT_QPA_PLATFORM" ] && grep -qi microsoft /proc/version 2>/dev/null; th
     export QT_QPA_PLATFORM=xcb
 fi
 if [ -x .venv/bin/python ]; then
-    exec .venv/bin/python native_app/main.py "$@"
+    exec .venv/bin/python quote_app/main.py "$@"
 fi
-exec python3 native_app/main.py "$@"
+exec python3 quote_app/main.py "$@"

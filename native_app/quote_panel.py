@@ -32,215 +32,117 @@ the panel's parts and stock; nothing is written back to the job.
 """
 
 import copy
-import math
 import os
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from bar_nest import BarStock
-from inventory import StockSheet
-from quoting.costing import MATERIAL, QUOTE, CostingSettings, QuoteEngine
-from quoting.features import (Bend, HoleFeature, PartFeatures, ProfileInfo, default_density,
-                              features_from_polygons)
-from quoting.operations import default_operations, painting
-from quoting.ops_assembly import QuoteCost
+from quoting.costing import MATERIAL, QUOTE
 from quoting.rates import load_rates, save_rates, starter_rates
 
-LINE_TYPES = ("sheet", "tube", "purchased", "assembly")
-TYPE_LABELS = {"sheet": "Sheet", "tube": "Tube / section", "section": "Tube / section",
-               "purchased": "Bought-in", "assembly": "Assembly"}
-PROFILE_KINDS = ("RHS", "SHS", "CHS", "FLAT", "ANGLE")
-END_CUTS = ("square", "mitre", "cope")
-TAP_DRILL = {"M3": 2.5, "M4": 3.3, "M5": 4.2, "M6": 5.0, "M8": 6.8, "M10": 8.5, "M12": 10.2}
-COST_AREAS = ("material", "cutting", "bending", "machining", "welding", "assembly",
-              "finishing", "purchased", "quote")
-DEFAULT_MARKUPS = {"material": 10.0, "purchased": 25.0}
-DEFAULT_MARKUP = 25.0
-FALLBACK_SHEET = (3000.0, 1500.0)
+# -------------------------------------------------------------- model
+# The editable quote (lines, settings) and the engine builder live in
+# quoting/quote_model.py, Qt-free; re-exported here for the panel's users.
+from quoting.quote_model import (COST_AREAS, DEFAULT_MARKUP, DEFAULT_MARKUPS, END_CUTS,  # noqa: E402,F401
+                                 FALLBACK_SHEET, LINE_TYPES, PROFILE_KINDS, TAP_DRILL, TYPE_LABELS,
+                                 LineSpec, QuoteSetup, build_engine, parse_breaks, quote_from_dict,
+                                 quote_to_dict, result_summary)
 
 
-# ------------------------------------------------------------------- model
+# ------------------------------------------------------------------ sources
 
-@dataclass
-class LineSpec:
-    """One quote line as the user edits it. `to_features()` turns it into
-    the engine's PartFeatures."""
-    name: str
-    part_type: str = "sheet"
-    quantity: int = 1
-    material: str = ""
-    thickness: Optional[float] = None
-    from_parts: bool = False              # mirrors a row of the Parts tab
-    # sheet
-    outer: list = field(default_factory=list)
-    holes: list = field(default_factory=list)
-    bends: Optional[int] = None           # None = unknown
-    bend_details: list = field(default_factory=list)
-    tapped_holes: int = 0
-    tap_size: str = "M8"
-    paint: bool = False
-    # tube / section
-    profile_kind: str = "RHS"
-    width: float = 100.0
-    height: float = 50.0
-    wall: float = 3.0
-    length: float = 1000.0
-    end_a: str = "square"
-    end_b: str = "square"
-    bar_length: float = 6000.0
-    price_per_m: float = 10.0
-    # bought-in
-    unit_cost: float = 0.0
-    supplier: str = ""
-    markup_pct: Optional[float] = None
-    # assembly
-    part_count: int = 0
-    fastener_count: int = 0
-    weld_length: float = 0.0
-    weld_type: str = "fillet"
+class QuoteSource(QtCore.QObject):
+    """Where the editor gets what it doesn't own: the parts to turn into
+    sheet lines, the sheet stock, the currency and the kerf. AlphaNest's
+    Quote tab reads them live from its nesting panel
+    (`NestingQuoteSource`); AlphaQuote, with no nesting job, keeps its own
+    (this base class: no parts, stock and currency set by the app)."""
+    parts_changed = QtCore.Signal()
+    currency_changed = QtCore.Signal(str)
 
-    # -- tube geometry -------------------------------------------------
-    def profile(self) -> ProfileInfo:
-        w, h, t = self.width, self.height, self.wall
-        kind = self.profile_kind
-        if kind == "SHS":
-            h = w
-        if kind == "CHS":
-            area = math.pi / 4 * (w ** 2 - max(w - 2 * t, 0) ** 2)
-            return ProfileInfo("CHS", w, w, t, area, math.pi * w)
-        if kind in ("RHS", "SHS"):
-            area = w * h - max(w - 2 * t, 0) * max(h - 2 * t, 0)
-            return ProfileInfo(kind, max(w, h), min(w, h), t, area, 2 * (w + h))
-        if kind == "FLAT":
-            return ProfileInfo("FLAT", max(w, t), min(w, t), t, w * t, 2 * (w + t))
-        return ProfileInfo("ANGLE", max(w, h), min(w, h), t, t * (w + h - t), 2 * (w + h))
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.currency_code = "INR"
+        self.stock_sheets: Optional[list] = None
+        self.stock_label = ""
 
-    def to_features(self) -> PartFeatures:
-        material = self.material.strip() or None
-        if self.part_type == "sheet":
-            if self.bend_details:
-                bends = [Bend(d.get("angle_deg"), d.get("length"), d.get("radius"), d.get("direction"))
-                         for d in self.bend_details]
-                if self.bends is not None and self.bends != len(bends):
-                    bends = [Bend() for _ in range(self.bends)]
-            else:
-                bends = None if self.bends is None else [Bend() for _ in range(self.bends)]
-            holes = [HoleFeature(TAP_DRILL.get(self.tap_size, 6.8), "tapped", self.tap_size,
-                                 count=self.tapped_holes)] if self.tapped_holes else []
-            f = features_from_polygons(self.name, self.outer, self.holes, material=material,
-                                       thickness=self.thickness, quantity=self.quantity,
-                                       bends=bends, hole_features=holes)
-            f.extra["paint"] = self.paint
-            return f
-        if self.part_type == "tube":
-            prof = self.profile()
-            f = PartFeatures(self.name, part_type="section" if not prof.hollow else "tube",
-                             material=material, quantity=self.quantity, profile=prof,
-                             length=self.length, end_cuts=(self.end_a, self.end_b),
-                             thickness=self.wall)
-            f.extra["paint"] = self.paint
-            return f
-        if self.part_type == "purchased":
-            return PartFeatures(self.name, part_type="purchased", quantity=self.quantity,
-                                unit_cost=self.unit_cost, supplier=self.supplier or None,
-                                markup=None if self.markup_pct is None else self.markup_pct / 100.0)
-        return PartFeatures(self.name, part_type="assembly", quantity=self.quantity, material=material,
-                            thickness=self.thickness, part_count=self.part_count,
-                            fastener_count=self.fastener_count,
-                            manual_weld_length=self.weld_length or None)
+    def parts(self):
+        """(name, material, qty per set, extracted data) per part."""
+        return []
 
-    def bar_stock(self) -> Optional[BarStock]:
-        if self.part_type != "tube":
-            return None
-        prof = self.profile()
-        density = default_density(self.material)
-        kg_per_m = prof.area * density / 1000.0 if density and prof.area else None
-        return BarStock(self.material or "", prof.designation, self.bar_length,
-                        price_per_m=self.price_per_m, kg_per_m=kg_per_m)
+    def stock(self):
+        return self.stock_sheets
 
-    def summary(self) -> str:
-        if self.part_type == "sheet":
-            t = f"{self.thickness:g} mm" if self.thickness else "? mm"
-            bends = "bends ?" if self.bends is None else f"{self.bends} bend(s)"
-            extra = [f"{self.tapped_holes}x {self.tap_size}"] if self.tapped_holes else []
-            if self.paint:
-                extra.append("painted")
-            return ", ".join([t, bends] + extra)
-        if self.part_type == "tube":
-            return f"{self.profile().designation} x {self.length:g} mm, ends {self.end_a}/{self.end_b}"
-        if self.part_type == "purchased":
-            return f"{self.unit_cost:.2f} each" + (f" from {self.supplier}" if self.supplier else "")
-        return (f"{self.part_count} parts, {self.fastener_count} fasteners, "
-                f"{self.weld_length:g} mm weld")
+    def kerf(self) -> float:
+        return 0.0
+
+    def set_currency(self, code):
+        self.currency_code = code
+        self.currency_changed.emit(code)
+
+    def set_stock(self, sheets, label=""):
+        self.stock_sheets = sheets or None
+        self.stock_label = label
 
 
-@dataclass
-class QuoteSetup:
-    breaks: List[int] = field(default_factory=lambda: [1, 10, 100])
-    material_mode: str = "nest"
-    allocation: str = "net_area"
-    tube_machine: str = "saw"
-    markups: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_MARKUPS))  # percent
-    default_markup: float = DEFAULT_MARKUP
-    paint_rate: float = 15.0
-    paint_setup: float = 25.0
-    transport: float = 80.0
-    fallback_price_per_kg: float = 1.20
-    kerf: float = 0.0
+class NestingQuoteSource(QuoteSource):
+    """AlphaNest's parts table, loaded inventory, currency and part spacing."""
+
+    def __init__(self, panel, parent=None):
+        super().__init__(parent)
+        self.panel = panel
+        panel.parts_changed.connect(self.parts_changed)
+        panel.currency_changed.connect(self.currency_changed)
+
+    @property
+    def currency_code(self):
+        return self.panel.currency_code
+
+    @currency_code.setter
+    def currency_code(self, _value):
+        pass  # AlphaNest's Stock tab owns the currency
+
+    def parts(self):
+        panel, out = self.panel, []
+        for row in range(panel.table.rowCount()):
+            item = panel.table.item(row, 0)
+            if item is None:
+                continue
+            data = panel._extracted.get(item.text())
+            if data is None:
+                continue
+            mat_item = panel.table.item(row, 1)
+            material = mat_item.text().strip() if mat_item else ""
+            if material.lower() == "unspecified":
+                material = ""
+            qty_w = panel.table.cellWidget(row, 2)
+            out.append((item.text(), material, qty_w.value() if qty_w else 1, data))
+        return out
+
+    def stock(self):
+        return self.panel._inventory_template
+
+    def kerf(self):
+        return self.panel.part_spacing.value()
 
 
-def parse_breaks(text: str) -> List[int]:
-    """"1, 10, 100" -> [1, 10, 100]; raises ValueError on anything else."""
-    out = []
-    for tok in text.replace(";", ",").replace(" ", ",").split(","):
-        if tok.strip():
-            v = int(tok)
-            if v < 1:
-                raise ValueError("quantities must be 1 or more")
-            out.append(v)
-    if not out:
-        raise ValueError("enter at least one quantity")
-    return sorted(set(out))
-
-
-def build_engine(lines: List[LineSpec], setup: QuoteSetup, rates, stock: Optional[List[StockSheet]]):
-    """(engine, features, notes) for `lines` -- Qt-free so it can be tested
-    and run on a worker thread."""
-    notes = []
-    features = [l.to_features() for l in lines]
-    sheet_stock = list(stock or [])
-    if not sheet_stock:
-        seen = set()
-        for f in features:
-            if f.part_type == "sheet" and f.material and f.thickness:
-                key = (f.material, f.thickness)
-                if key in seen:
-                    continue
-                seen.add(key)
-                sheet_stock.append(StockSheet(f.material, f.thickness, *FALLBACK_SHEET,
-                                              price_per_kg=setup.fallback_price_per_kg,
-                                              density_g_cm3=f.density()))
-        if seen:
-            notes.append(f"No stock loaded on the Stock tab: sheet material is priced on "
-                         f"{FALLBACK_SHEET[0]:g}x{FALLBACK_SHEET[1]:g} sheets at "
-                         f"{setup.fallback_price_per_kg:g}/kg.")
-    bars, seen_bars = [], set()
-    for l in lines:
-        b = l.bar_stock()
-        if b is not None and (b.material, b.profile) not in seen_bars:
-            seen_bars.add((b.material, b.profile))
-            bars.append(b)
-    ops = default_operations(rates, tube_machine=setup.tube_machine) + [
-        painting(setup.paint_rate, setup=setup.paint_setup)]
-    settings = CostingSettings(
-        allocation=setup.allocation, material_mode=setup.material_mode, kerf=setup.kerf,
-        markups={k: v / 100.0 for k, v in setup.markups.items()},
-        default_markup=setup.default_markup / 100.0)
-    quote_costs = [QuoteCost("transport", setup.transport)] if setup.transport else []
-    return QuoteEngine(rates, sheet_stock, bars, operations=ops, settings=settings,
-                       quote_costs=quote_costs), features, notes
+def spec_from_part(name, material, qty, data, from_parts=False) -> LineSpec:
+    """A sheet line from an imported part ({outer, holes, thickness, ...}
+    as the part importers produce it), taking bends and tapped holes from
+    a FreeCAD import when it has them."""
+    spec = LineSpec(name=name, part_type="sheet", quantity=qty, from_parts=from_parts,
+                    outer=[tuple(p) for p in data["outer"]],
+                    holes=[[tuple(p) for p in h] for h in data["holes"]],
+                    material=material or "", thickness=data.get("thickness"))
+    bends = data.get("bends")
+    spec.bend_details = list(data.get("bend_details") or [])
+    spec.bends = (len(spec.bend_details) if spec.bend_details else
+                  int(bends) if isinstance(bends, (int, float)) and data.get("method") != "dxf" else None)
+    tapped = [h for h in data.get("hole_features") or [] if h.get("kind") == "tapped"]
+    if tapped:
+        spec.tapped_holes = sum(int(h.get("count", 1)) for h in tapped)
+        spec.tap_size = tapped[0].get("thread") or spec.tap_size
+    return spec
 
 
 # ------------------------------------------------------------------ worker
@@ -287,13 +189,17 @@ def _ispin(lo, hi):
 class QuotePanel(QtWidgets.QWidget):
     busy_changed = QtCore.Signal(bool)
     quote_ready = QtCore.Signal()
+    changed = QtCore.Signal()          # anything the user edits, or a new price
 
     LINE_COLS = ("Line", "Type", "Qty / set", "Material", "Details")
 
-    def __init__(self, panel, parent=None):
+    def __init__(self, source, parent=None, parts_hint="add parts on the Parts tab"):
         super().__init__(parent)
         self.setObjectName("QuotePanel")
-        self.panel = panel
+        if not isinstance(source, QuoteSource):
+            source = NestingQuoteSource(source, self)   # an AlphaNest NestingPanel
+        self.source = source
+        self.parts_hint = parts_hint
         self.lines: List[LineSpec] = []
         self.setup = QuoteSetup()
         self.rates = starter_rates()
@@ -306,9 +212,20 @@ class QuotePanel(QtWidgets.QWidget):
         self._filling_grid = False
 
         self._build()
-        panel.parts_changed.connect(self.sync_from_parts)
-        panel.currency_changed.connect(lambda *_: self._fill_results())
+        source.parts_changed.connect(self.sync_from_parts)
+        source.currency_changed.connect(lambda *_: self._fill_results())
+        for w in (self.s_breaks,):
+            w.editingFinished.connect(self._emit_changed)
+        for w in (self.s_mode, self.s_alloc, self.s_tube):
+            w.currentIndexChanged.connect(self._emit_changed)
+        for w in (self.s_price_kg, self.s_paint, self.s_transport):
+            w.valueChanged.connect(self._emit_changed)
+        self.s_markups.itemChanged.connect(self._emit_changed)
         self.sync_from_parts()
+
+    def _emit_changed(self, *_):
+        if not self._loading:
+            self.changed.emit()
 
     # ------------------------------------------------------------ layout
 
@@ -567,56 +484,42 @@ class QuotePanel(QtWidgets.QWidget):
 
     # ------------------------------------------------------------- lines
 
-    def _app_parts(self):
-        """(name, material, qty per assembly, extracted data) per Parts-tab row."""
-        panel, out = self.panel, []
-        for row in range(panel.table.rowCount()):
-            item = panel.table.item(row, 0)
-            if item is None:
-                continue
-            data = panel._extracted.get(item.text())
-            if data is None:
-                continue
-            mat_item = panel.table.item(row, 1)
-            material = mat_item.text().strip() if mat_item else ""
-            if material.lower() == "unspecified":
-                material = ""
-            qty_w = panel.table.cellWidget(row, 2)
-            out.append((item.text(), material, qty_w.value() if qty_w else 1, data))
-        return out
-
     def sync_from_parts(self):
         """Keep one sheet line per Parts-tab part, carrying over anything
         typed on the Quote tab for a part that's still there."""
         previous = {l.name: l for l in self.lines if l.from_parts}
         synced = []
-        for name, material, qty, data in self._app_parts():
+        for name, material, qty, data in self.source.parts():
             old = previous.get(name)
-            spec = LineSpec(name=name, part_type="sheet", quantity=qty, from_parts=True,
-                            outer=[tuple(p) for p in data["outer"]],
-                            holes=[[tuple(p) for p in h] for h in data["holes"]])
+            spec = spec_from_part(name, material, qty, data, from_parts=True)
             if old is not None:
                 for attr in ("material", "thickness", "bends", "bend_details", "tapped_holes", "tap_size",
                              "paint", "quantity"):
                     setattr(spec, attr, getattr(old, attr))
                 if material and not old.material:
                     spec.material = material
-            else:
-                spec.material = material
-                spec.thickness = data.get("thickness")
-                bends = data.get("bends")
-                spec.bend_details = list(data.get("bend_details") or [])
-                spec.bends = (len(spec.bend_details) if spec.bend_details else
-                              int(bends) if isinstance(bends, (int, float)) and data.get("method") != "dxf"
-                              else None)
-                tapped = [h for h in data.get("hole_features") or [] if h.get("kind") == "tapped"]
-                if tapped:
-                    spec.tapped_holes = sum(int(h.get("count", 1)) for h in tapped)
-                    spec.tap_size = tapped[0].get("thread") or spec.tap_size
             synced.append(spec)
         others = [l for l in self.lines if not l.from_parts]
+        before = [l.name for l in self.lines if l.from_parts]
         self.lines = synced + others
         self._fill_lines()
+        if before != [l.name for l in synced]:
+            self._emit_changed()
+
+    def add_parts(self, extracted: dict):
+        """Imported parts ({name: data}, as native_app/file_part_source.py
+        returns them) as ordinary sheet lines -- AlphaQuote's Add Parts."""
+        added = []
+        for name, data in extracted.items():
+            material = data.get("material") or ""
+            spec = spec_from_part(self._unique_name(name), material, int(data.get("quantity", 1)), data)
+            self.lines.append(spec)
+            added.append(spec)
+        self._fill_lines()
+        if added:
+            self.lines_table.selectRow(self.lines.index(added[0]))
+            self._emit_changed()
+        return added
 
     @staticmethod
     def _material_text(spec):
@@ -643,6 +546,7 @@ class QuotePanel(QtWidgets.QWidget):
         self.lines.append(spec)
         self._fill_lines()
         self.lines_table.selectRow(len(self.lines) - 1)
+        self._emit_changed()
         return spec
 
     def remove_selected_line(self):
@@ -655,6 +559,7 @@ class QuotePanel(QtWidgets.QWidget):
             return
         self.lines.remove(spec)
         self._fill_lines()
+        self._emit_changed()
 
     def _fill_lines(self):
         keep = self._selected_line()
@@ -778,6 +683,7 @@ class QuotePanel(QtWidgets.QWidget):
         for c, v in enumerate(vals):
             self.lines_table.item(row, c).setText(v)
         self.form_box.setTitle(f"{TYPE_LABELS[spec.part_type]}: {spec.name}")
+        self._emit_changed()
 
     # ------------------------------------------------------------ settings
 
@@ -787,7 +693,7 @@ class QuotePanel(QtWidgets.QWidget):
                        tube_machine=self.s_tube.currentData(),
                        paint_rate=self.s_paint.value(), transport=self.s_transport.value(),
                        fallback_price_per_kg=self.s_price_kg.value(),
-                       kerf=self.panel.part_spacing.value())
+                       kerf=self.source.kerf())
         s.markups = {}
         for i, area in enumerate(COST_AREAS):
             text = (self.s_markups.item(i, 0).text() if self.s_markups.item(i, 0) else "").strip()
@@ -796,6 +702,84 @@ class QuotePanel(QtWidgets.QWidget):
             except ValueError:
                 raise ValueError(f"markup for {area} isn't a number: {text!r}") from None
         return s
+
+    def write_setup(self, setup: QuoteSetup):
+        """Put `setup` into the settings widgets (a reopened quote)."""
+        was, self._loading = self._loading, True
+        try:
+            self.s_breaks.setText(", ".join(str(b) for b in setup.breaks))
+            for combo, value in ((self.s_mode, setup.material_mode), (self.s_alloc, setup.allocation),
+                                 (self.s_tube, setup.tube_machine)):
+                i = combo.findData(value)
+                if i >= 0:
+                    combo.setCurrentIndex(i)
+            self.s_price_kg.setValue(setup.fallback_price_per_kg)
+            self.s_paint.setValue(setup.paint_rate)
+            self.s_transport.setValue(setup.transport)
+            for i, area in enumerate(COST_AREAS):
+                self.s_markups.setItem(i, 0, QtWidgets.QTableWidgetItem(
+                    f"{setup.markups.get(area, setup.default_markup):g}"))
+        finally:
+            self._loading = was
+
+    def get_state(self) -> dict:
+        """The quote as plain JSON (quote_model.quote_to_dict), settings as
+        currently shown. Unparseable settings fall back to the last good ones."""
+        try:
+            setup = self.read_setup()
+            self.setup = setup
+        except ValueError:
+            setup = self.setup
+        return quote_to_dict(self.lines, setup, self.overrides)
+
+    def set_state(self, data: Optional[dict], summary: Optional[list] = None):
+        """Load a saved quote into the editor; `summary` is its last priced
+        summary (quote_model.result_summary), shown until it's priced again."""
+        if self.busy:
+            self.wait()
+        lines, setup, overrides = quote_from_dict(data or {})
+        self._loading = True
+        try:
+            self.lines = [l for l in lines if not l.from_parts]
+            self.setup, self.overrides = setup, overrides
+            self.result, self.result_notes = None, []
+            self.write_setup(setup)
+            self.grid.clear()
+            self.grid.setRowCount(0)
+            self.grid.setColumnCount(0)
+            self.notes.clear()
+            self.grid_label.clear()
+        finally:
+            self._loading = False
+        self.sync_from_parts()
+        self._fill_lines()
+        self.show_summary(summary or [])
+
+    def priced_summary(self) -> list:
+        return result_summary(self.result) if self.result is not None else []
+
+    def show_summary(self, rows: list):
+        """A stored summary (no breakdown) -- a reopened quote before re-pricing."""
+        self.summary.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            margin = (row["price"] - row["cost"]) / row["price"] if row["price"] else 0.0
+            vals = (str(row["sets"]), self._money(row["cost"]), self._money(row["price"]),
+                    self._money(row["set_price"]), f"{margin:.0%}",
+                    "Complete" if row.get("complete") else "Incomplete")
+            for c, v in enumerate(vals):
+                item = QtWidgets.QTableWidgetItem(v)
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.summary.setItem(r, c, item)
+        self._fit_summary()
+        self.status_label.setText(
+            "Last saved price shown -- click Price Quote for the full breakdown." if rows
+            else "Not priced yet -- click Price Quote.")
+
+    def _fit_summary(self):
+        self.summary.resizeRowsToContents()
+        h = self.summary.horizontalHeader().height() + 2 * self.summary.frameWidth() + sum(
+            self.summary.rowHeight(r) for r in range(self.summary.rowCount()))
+        self.summary.setFixedHeight(min(h + 2, 260))
 
     def _refresh_rates_label(self):
         n_uncal = len(self.rates.uncalibrated_rows())
@@ -820,6 +804,7 @@ class QuotePanel(QtWidgets.QWidget):
         self.rates = table
         self.rates_source = os.path.basename(path)
         self._refresh_rates_label()
+        return path
 
     def export_rates_file(self, path=None):
         if path is None:
@@ -846,7 +831,7 @@ class QuotePanel(QtWidgets.QWidget):
         if self.busy:
             return
         if not self.lines:
-            self.status_label.setText("Nothing to quote -- add parts on the Parts tab, or add a line.")
+            self.status_label.setText(f"Nothing to quote -- {self.parts_hint}, or add a line.")
             return
         try:
             setup = self.read_setup()
@@ -854,7 +839,7 @@ class QuotePanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Quote", str(e))
             return
         lines = copy.deepcopy(self.lines)
-        stock = copy.deepcopy(self.panel._inventory_template) if self.panel._inventory_template else None
+        stock = copy.deepcopy(self.source.stock()) if self.source.stock() else None
         self._worker = _PriceWorker(lines, setup, self.rates, stock, self)
         self._worker.priced.connect(self._on_priced)
         self._worker.failed.connect(self._on_failed)
@@ -893,12 +878,13 @@ class QuotePanel(QtWidgets.QWidget):
                     cell.override = v
         self._fill_results()
         self.quote_ready.emit()
+        self.changed.emit()
 
     # ------------------------------------------------------------- results
 
     def _money(self, v):
         import nesting_widgets
-        sym = nesting_widgets.CURRENCY_SYMBOLS.get(self.panel.currency_code, "")
+        sym = nesting_widgets.CURRENCY_SYMBOLS.get(self.source.currency_code, "")
         return "—" if v is None else f"{sym}{v:,.2f}"
 
     def _fill_results(self):
@@ -917,10 +903,7 @@ class QuotePanel(QtWidgets.QWidget):
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
                 self.summary.setItem(r, c, item)
         self.summary.selectRow(min(keep, len(res.breaks) - 1) if keep is not None else 0)
-        self.summary.resizeRowsToContents()
-        h = self.summary.horizontalHeader().height() + 2 * self.summary.frameWidth() + sum(
-            self.summary.rowHeight(r) for r in range(self.summary.rowCount()))
-        self.summary.setFixedHeight(min(h + 2, 260))
+        self._fit_summary()
         uncal = len(self.rates.uncalibrated_rows())
         self.status_label.setText(
             f"{len(res.breaks)} quantity break(s) priced." +
@@ -1058,6 +1041,7 @@ class QuotePanel(QtWidgets.QWidget):
             cell.override = value
             self.overrides[okey] = value
         QtCore.QTimer.singleShot(0, self._fill_results)
+        self.changed.emit()
 
     def set_override(self, line_name, key, value, quantity=None):
         """Scripted equivalent of typing into a grid cell (None clears)."""
@@ -1069,6 +1053,7 @@ class QuotePanel(QtWidgets.QWidget):
         else:
             self.overrides[(br.quantity, line_name, key)] = value
         self._fill_results()
+        self.changed.emit()
 
     # -------------------------------------------------------------- export
 

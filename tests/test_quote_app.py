@@ -37,6 +37,7 @@ def app():
 def win(app, settings_dir, monkeypatch):
     from quote_app.main_window import QuoteAppWindow
     monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: None)
+    monkeypatch.setenv("ALPHAQUOTE_RATE_CARD", str(settings_dir / "rate_card.xlsx"))   # never the real one
     w = QuoteAppWindow(str(settings_dir / "quotes.db"))
     w.show()
     app.processEvents()
@@ -273,3 +274,35 @@ def test_main_parses_arguments(monkeypatch, settings_dir):
     with pytest.raises(SystemExit):
         entry.main(["--db", str(settings_dir / "x.db"), "--open", "7"])
     assert opened["db"] == str(settings_dir / "x.db") and opened["id"] == 7
+
+
+# -------------------------------------------------------------- rate card
+
+def test_rate_card_load_view_and_autoload(win, settings_dir):
+    pytest.importorskip("openpyxl")
+    from quote_app.main_window import QuoteAppWindow, RateCardDialog
+    from quoting.rate_card import example_rate_card, save_rate_card
+    assert win.rate_card is None and "No rate card" in win.rate_card_label.text()
+    path = str(settings_dir / "rate_card.xlsx")        # the default location (env set by the fixture)
+    save_rate_card(path, example_rate_card())
+    card = win.load_rate_card(path)
+    assert card is not None and win.source.rate_card is card
+    assert "Example shop" in win.rate_card_label.text()
+    dlg = RateCardDialog(card, win)
+    titles = [dlg.tabs.tabText(i) for i in range(dlg.tabs.count())]
+    assert titles == ["Settings", "Materials", "Processes", "Others", "Fasteners"]
+    assert dlg.tabs.widget(1).rowCount() == len(card.materials)
+    dlg.close()
+    win.close()
+    again = QuoteAppWindow(str(settings_dir / "quotes.db"))
+    try:
+        assert again.rate_card is not None and len(again.rate_card.processes) == len(card.processes)
+    finally:
+        again.close()
+
+
+def test_bad_rate_card_is_refused(win, settings_dir):
+    bad = settings_dir / "empty.xlsx"
+    import openpyxl
+    openpyxl.Workbook().save(str(bad))
+    assert win.load_rate_card(str(bad)) is None and win.rate_card is None

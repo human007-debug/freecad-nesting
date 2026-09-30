@@ -10,3 +10,9 @@ build/
 # the exact machine/Python ABI that built it.
 geometry_fast.c
 geometry_fast*.so
+
+# A shop's rate card holds its real prices and margins -- kept local, next
+# to AlphaQuote's database (quoting/rate_card.py), never committed.
+rate_card*.xlsx
+*_rate_card*.xlsx
+*rate-card*.xlsx

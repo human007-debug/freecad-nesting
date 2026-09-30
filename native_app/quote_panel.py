@@ -65,6 +65,7 @@ class QuoteSource(QtCore.QObject):
         self.currency_code = "INR"
         self.stock_sheets: Optional[list] = None
         self.stock_label = ""
+        self.rate_card = None        # quoting.rate_card.RateCard, when the app has loaded one
 
     def parts(self):
         """(name, material, qty per set, extracted data) per part."""

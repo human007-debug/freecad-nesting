@@ -40,6 +40,7 @@ from native_app.ribbon import Ribbon
 from quote_app import launch
 from quoting.db import STATUSES, Customer, QuoteDB
 from quoting.quote_model import nesting_parts_json, parse_breaks
+from quoting.rate_card import default_rate_card_path, load_rate_card
 
 SETTINGS_ORG = "AlphaNest"
 SETTINGS_APP = "AlphaQuote"
@@ -149,6 +150,48 @@ class CustomersDialog(QtWidgets.QDialog):
             return
         self.db.delete_customer(c.id)
         self._reload()
+
+
+class RateCardDialog(QtWidgets.QDialog):
+    """Read-only view of the loaded rate card, one tab per sheet. The card
+    is edited in Excel and loaded again."""
+
+    def __init__(self, card, parent=None):
+        super().__init__(parent)
+        from dataclasses import fields
+        self.setWindowTitle(f"Rate card -- {card.setting('company') or os.path.basename(card.source)}")
+        self.resize(900, 520)
+        v = QtWidgets.QVBoxLayout(self)
+        where = QtWidgets.QLabel(f"{card.source}\nEdit this file in Excel, then Load Rate Card again.")
+        where.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        v.addWidget(where)
+        tabs = QtWidgets.QTabWidget()
+        v.addWidget(tabs, 1)
+        self.tabs = tabs
+        settings = [(k, card.setting(k)) for k in card.settings]
+        tabs.addTab(self._table(["Setting", "Value"], settings), "Settings")
+        for title, rows in (("Materials", card.materials), ("Processes", card.processes),
+                            ("Others", card.others), ("Fasteners", card.fasteners)):
+            if rows:
+                cols = [f.name for f in fields(type(rows[0]))]
+                tabs.addTab(self._table(cols, [[getattr(r, c) for c in cols] for r in rows]), title)
+        close = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        close.rejected.connect(self.accept)
+        v.addWidget(close)
+
+    @staticmethod
+    def _table(heads, rows):
+        t = QtWidgets.QTableWidget(len(rows), len(heads))
+        t.setHorizontalHeaderLabels([h.replace("_", " ").capitalize() for h in heads])
+        t.verticalHeader().hide()
+        t.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        for r, row in enumerate(rows):
+            for c, v in enumerate(row):
+                t.setItem(r, c, QtWidgets.QTableWidgetItem("" if v is None else f"{v:g}" if isinstance(v, float)
+                                                           else str(v)))
+        t.resizeColumnsToContents()
+        t.horizontalHeader().setStretchLastSection(True)
+        return t
 
 
 class QuoteAppWindow(QtWidgets.QMainWindow):
@@ -350,7 +393,19 @@ class QuoteAppWindow(QtWidgets.QMainWindow):
         self.stock_label.setMinimumWidth(180)
         stock.add_widget(self.stock_label)
 
-        rates = setup.add_group("Rates")
+        card = setup.add_group("Rate Card")
+        load_card = card.add_large("load-inventory", "\u2b06", "Load\nRate Card")
+        load_card.setToolTip("Your shop's rate card (.xlsx): material per kg, process rates, other "
+                             "charges, margin and GST, and the sheet formula. Kept on this computer, "
+                             "never in the repo.")
+        load_card.clicked.connect(lambda: self.load_rate_card())
+        view_card = card.add_small("report", "\u25a6", "View rate card")
+        view_card.clicked.connect(self.view_rate_card)
+        self.rate_card_label = QtWidgets.QLabel()
+        self.rate_card_label.setMinimumWidth(200)
+        card.add_widget(self.rate_card_label)
+
+        rates = setup.add_group("Machine Rates")
         load_rates = rates.add_small("load-inventory", "⬆", "Load rates...")
         load_rates.clicked.connect(lambda: self.load_rates())
         export_rates = rates.add_small("export-dxf", "⬇", "Export rates...")
@@ -396,6 +451,12 @@ class QuoteAppWindow(QtWidgets.QMainWindow):
             self.load_stock(stock_path, quiet=True)
         else:
             self._refresh_stock_label()
+        self.rate_card = None
+        card_path = self.settings.value("rate_card_path", "") or default_rate_card_path()
+        if card_path and os.path.exists(card_path):
+            self.load_rate_card(card_path, quiet=True)
+        else:
+            self._refresh_rate_card_label()
         rates_path = self.settings.value("rates_path", "")
         if rates_path and os.path.exists(rates_path):
             self.editor.load_rates_file(rates_path)
@@ -722,6 +783,47 @@ class QuoteAppWindow(QtWidgets.QMainWindow):
         loaded = self.editor.load_rates_file(path)
         if loaded:
             self.settings.setValue("rates_path", loaded)
+
+    def load_rate_card(self, path=None, quiet=False):
+        """Load a shop rate card (quoting/rate_card.py) and remember where it is."""
+        if path is None:
+            start = os.path.dirname(default_rate_card_path())
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Load rate card", start, "Rate card (*.xlsx *.xlsm);;All files (*)")
+            if not path:
+                return None
+        try:
+            card = load_rate_card(path)
+        except Exception as e:  # noqa: BLE001
+            if not quiet:
+                QtWidgets.QMessageBox.warning(self, "AlphaQuote", f"Couldn't load the rate card {path}:\n{e}")
+            return None
+        if not (card.materials or card.processes):
+            if not quiet:
+                QtWidgets.QMessageBox.warning(self, "AlphaQuote", f"{path} has no material or process rates.")
+            return None
+        self.rate_card = card
+        self.source.rate_card = card
+        self.settings.setValue("rate_card_path", path)
+        self._refresh_rate_card_label()
+        return card
+
+    def _refresh_rate_card_label(self):
+        card = getattr(self, "rate_card", None)
+        if card is None:
+            self.rate_card_label.setText("No rate card loaded")
+            self.rate_card_label.setToolTip(f"Put yours at {default_rate_card_path()} to load it automatically.")
+            return
+        who = card.setting("company") or os.path.basename(card.source)
+        self.rate_card_label.setText(f"{who}: {len(card.materials)} materials,\n"
+                                     f"{len(card.processes)} processes")
+        self.rate_card_label.setToolTip(card.source)
+
+    def view_rate_card(self):
+        if self.rate_card is None:
+            QtWidgets.QMessageBox.information(self, "AlphaQuote", "No rate card loaded -- Load Rate Card first.")
+            return
+        RateCardDialog(self.rate_card, self).exec()
 
     def use_starter_rates(self):
         from quoting.rates import starter_rates

@@ -1700,6 +1700,18 @@ or by double-clicking `quote_app\run.bat` (Windows), using the same
   (load, export, back to the starter rates), customers, currency, dark
   mode. These are remembered between sessions.
 
+**Rate card.** Your shop's own prices live in a *rate card*, an Excel file
+with sheets for Settings (sheet size and allowances, density, margin, GST,
+quote rounding), Materials (₹/kg by grade, shape and thickness band, usage
+%, scrap ₹/kg), Processes (per metre / stroke / piece / kg / sq ft; laser
+can be "per mm of thickness"), Others (packing, inspection, lab test...)
+and Fasteners. It is kept **on your computer, never in this repo** —
+`rate_card.xlsx` next to the quote database is loaded automatically, or
+use **Setup → Load Rate Card**; **View rate card** shows what's loaded.
+`.gitignore` blocks rate-card files from commits. `quoting/rate_card.py`
+defines the format and the BOM sheet formula (qty per sheet, sheet and
+strip weights) and ships only placeholder example values.
+
 The database is one SQLite file: `~/.local/share/AlphaQuote/quotes.db` on
 Linux/WSL, `%APPDATA%\AlphaQuote\quotes.db` on Windows, or wherever
 `ALPHAQUOTE_DB` points. Use `quote_app/main.py --db PATH` to open a

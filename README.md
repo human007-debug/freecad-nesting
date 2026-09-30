@@ -16,7 +16,18 @@ AlphaNest comes two ways — use either or both. Both need the **whole
 repo**, not just one folder: the engine (`nester.py`, `geometry.py`, …)
 lives at the repo root and is shared by the app and the workbench.
 
-**Download:** `git clone https://github.com/human007-debug/freecad-nesting.git`,
+**Just want the app?** Download the ready-built one-file app from the
+repo's **Releases** page (or the latest **Actions → Build app** run):
+`AlphaNest-Windows.zip` (`AlphaNest.exe`), `AlphaNest-macOS.zip`
+(`AlphaNest.app`) or `AlphaNest-Linux.zip` (`AlphaNest`, `chmod +x` it).
+Unzip and run. No Python or install needed. It starts in
+`Documents/AlphaNest`, where auto-reports go by default. Importing
+`.FCStd`/STEP/IGES still needs FreeCAD installed (see Option A). The
+builds are unsigned, so the first launch shows a warning: on Windows click
+**More info → Run anyway**, and on macOS right-click the app → **Open**.
+To build it yourself, see [Packaging](#packaging-the-one-file-app).
+
+**Download the source:** `git clone https://github.com/human007-debug/freecad-nesting.git`,
 or on GitHub click **Code → Download ZIP** and unzip it.
 
 ### Option A — standalone app (no FreeCAD needed for DXF)
@@ -33,6 +44,31 @@ Then start it with `native_app/run.sh` (Linux/macOS) or by double-clicking
 `native_app\run.bat` (Windows). Importing `.FCStd`/STEP/IGES files also
 needs FreeCAD installed. The app finds it automatically; if it can't, set
 `ALPHANEST_FREECADCMD` to the full path of `FreeCADCmd`/`freecadcmd`.
+
+### Packaging the one-file app
+
+`packaging/build.py` bundles the app, Python, Qt and every dependency into
+one file with PyInstaller. The result goes in `dist/`: `AlphaNest.exe`,
+`AlphaNest` (Linux) or `AlphaNest.app`. PyInstaller can't cross-compile,
+so each OS has to build its own. `.github/workflows/build-app.yml` builds
+all three on GitHub. Run it by hand from the Actions tab, or push a `v*`
+tag to have the three zips attached to a Release.
+
+```bash
+.venv/bin/pip install -r requirements.txt -r packaging/requirements-build.txt
+.venv/bin/python packaging/build.py
+```
+
+What is different in the packaged build (`sys.frozen`):
+- `main.py` calls `multiprocessing.freeze_support()`, which the GA's
+  parallel search needs on Windows, where it spawns workers instead of
+  forking. It also changes directory to `~/Documents/AlphaNest`.
+- `freecad_bridge.py` can't hand FreeCADCmd the bundled extractor, which
+  sits in the bundle's temp unpack folder, and a flatpak FreeCAD can't see
+  that folder. It copies `freecad_extract.py` and `vendor/` to a per-user
+  cache folder instead (`%LOCALAPPDATA%\AlphaNest`, `~/Library/Caches/AlphaNest`
+  or `~/.cache/AlphaNest`).
+- FreeCAD itself is not bundled.
 
 ### Option B — FreeCAD workbench
 

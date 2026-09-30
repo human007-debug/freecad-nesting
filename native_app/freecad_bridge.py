@@ -35,6 +35,12 @@ flatpak being unable to see this project's own Claude Code scratchpad
 directory. The project directory itself is a path the sandbox can already
 read/write (the workbench relies on this too), so scratch files go there
 instead.
+
+In the packaged (PyInstaller) build the project directory is the bundle's
+own unpack folder -- under the system temp dir for the one-file build, and
+read-only inside a macOS .app -- so `_work_root()` instead stages the
+extractor (plus `vendor/`, for SheetMetal's networkx) into a per-user
+folder under the home directory, which the flatpak sandbox can see too.
 """
 
 import glob
@@ -50,6 +56,32 @@ DEFAULT_FREECAD_CMD = ["flatpak", "run", "--command=FreeCADCmd", "org.freecad.Fr
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EXTRACTOR = os.path.join(_PROJECT_ROOT, "freecad_extract.py")
+
+
+def _user_work_dir():
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Caches")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "AlphaNest")
+
+
+def _work_root():
+    """`(scratch_root, extractor_path)` -- the project directory when run
+    from source, or a staged per-user copy in the packaged build (see
+    module docstring)."""
+    if not getattr(sys, "frozen", False):
+        return _PROJECT_ROOT, _EXTRACTOR
+    root = _user_work_dir()
+    os.makedirs(root, exist_ok=True)
+    extractor = os.path.join(root, "freecad_extract.py")
+    shutil.copyfile(_EXTRACTOR, extractor)  # always: a new app version may ship a new extractor
+    vendor, staged_vendor = os.path.join(_PROJECT_ROOT, "vendor"), os.path.join(root, "vendor")
+    if os.path.isdir(vendor) and not os.path.isdir(staged_vendor):  # ~10MB: copy once, not per import
+        shutil.copytree(vendor, staged_vendor)
+    return root, extractor
 
 
 def find_freecad_cmd():
@@ -96,9 +128,10 @@ def import_fcstd(paths, kfactor=0.4, tolerance=0.25, min_area=0.0, qty_overrides
     instead of it vanishing the way it would into FreeCAD's own Report View."""
     freecad_cmd = freecad_cmd or find_freecad_cmd()
 
-    with tempfile.TemporaryDirectory(dir=_PROJECT_ROOT) as tmp_dir:
+    work_root, extractor = _work_root()
+    with tempfile.TemporaryDirectory(dir=work_root) as tmp_dir:
         out_path = os.path.join(tmp_dir, "parts.json")
-        cmd = [*freecad_cmd, _EXTRACTOR, "--pass", *paths,
+        cmd = [*freecad_cmd, extractor, "--pass", *paths,
                f"output={out_path}", f"kfactor={kfactor}", f"tolerance={tolerance}", f"min_area={min_area}"]
         for label, n in (qty_overrides or {}).items():
             cmd.append(f"qty:{label}={n}")

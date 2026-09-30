@@ -10,3 +10,6 @@ build/
 # the exact machine/Python ABI that built it.
 geometry_fast.c
 geometry_fast*.so
+
+# packaging/build.py output
+dist/

@@ -1189,6 +1189,7 @@ normal and `mono` form. Suite: 126 tests.
 | `microjoints.py`      | Pure geometry: splits a contour into open polylines with small uncut tab gaps |
 | `remnant.py`          | Pure geometry: largest empty rectangle left on a cut sheet, for automatic remnant capture |
 | `commonline.py`       | Pure geometry: detects/splits exact shared edges between placed parts, for common-line cutting |
+| `quote_demo.py`       | Example: quotes a small welded frame at 1/10/100 sets with the `quoting/` engine and prints the breakdown (`python3 quote_demo.py`) |
 | `bar_nest.py`         | Plain python3: 1D bar/tube/section length nesting (first-fit decreasing + local improvement, kerf and trim ends, remnants) |
 | `quoting/`            | Plain python3, no FreeCAD: AlphaQuote's quoting core — part features, part-type classification, rate tables (SQLite/XLSX), cost-centre operations and the quantity-break quote engine. See `docs/QUOTING_PLAN.md` |
 | `nesting_widgets.py`  | The nesting UI itself (binding-agnostic `QWidget`), shared by the FreeCAD workbench and the native app — see "Native app" below |

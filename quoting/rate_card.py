@@ -78,6 +78,8 @@ SETTINGS_DEFAULTS = {
     "width_gap": 5.0,
     "length_gap_is_thickness": True,
     "tube_cut_allowance": 10.0,
+    "bar_length": 6000.0,
+    "tube_perimeter": "outer",
     "margin_pct": 12.0,
     "margin_label": "MARGIN",
     "gst_pct": 18.0,
@@ -189,6 +191,7 @@ class SheetFormula:
     width_gap: float = 5.0
     length_gap_is_thickness: bool = True
     tube_cut_allowance: float = 10.0
+    tube_perimeter: str = "outer"
 
     @property
     def kg_per_mm3(self) -> float:
@@ -222,11 +225,13 @@ class SheetFormula:
         return self.sheet_weight(t) / n
 
     def square_tube_weight(self, t, side, l) -> float:
-        """Perimeter x wall x length -- the sheets' own approximation."""
-        return t * side * 4 * l * self.kg_per_mm3
+        """Perimeter x wall x length -- outer perimeter (4 x side), or the
+        mean one (4 x (side - wall)) with `tube_perimeter = "mean"`."""
+        return self.rect_tube_weight(t, side, side, l)
 
     def rect_tube_weight(self, t, a, b, l) -> float:
-        return t * 2 * (a + b) * l * self.kg_per_mm3
+        per = 2 * (a + b) - (4 * t if self.tube_perimeter == "mean" else 0)
+        return t * per * l * self.kg_per_mm3
 
     def round_tube_weight(self, t, od, l) -> float:
         return math.pi * od * t * l * self.kg_per_mm3
@@ -252,7 +257,12 @@ class RateCard:
         kw = {}
         for f in fields(SheetFormula):
             v = self.setting(f.name)
-            kw[f.name] = _as_bool(v) if isinstance(f.default, bool) else float(v)
+            if isinstance(f.default, bool):
+                kw[f.name] = _as_bool(v)
+            elif isinstance(f.default, str):
+                kw[f.name] = _norm(v) or f.default
+            else:
+                kw[f.name] = float(v)
         return SheetFormula(**kw)
 
     def material(self, grade: str, shape: str = "sheet", thickness: Optional[float] = None) -> MaterialRate:
@@ -338,7 +348,9 @@ def save_rate_card(path: str, card: RateCard):
         "strip_allowance": "added to a long part's length when it takes its own strip",
         "width_gap": "gap between parts across the sheet when counting qty/sheet",
         "length_gap_is_thickness": "gap along the sheet = material thickness",
-        "tube_cut_allowance": "added to each tube/rod length",
+        "tube_cut_allowance": "added to each tube length",
+        "bar_length": "stock length rods and flats are bought in, mm",
+        "tube_perimeter": "outer (4 x side x wall) or mean (4 x (side - wall) x wall) for square/rect tube",
         "margin_pct": "default margin on ALL TOTAL -- adjusted per quote",
         "margin_label": "MARGIN or CONTINGENCIES",
         "gst_pct": "GST on BASIC COST",
@@ -378,6 +390,8 @@ def load_rate_card(path: str) -> RateCard:
                 default = SETTINGS_DEFAULTS.get(key)
                 if isinstance(default, bool):
                     value = _as_bool(value)
+                elif isinstance(default, str) and value is not None:
+                    value = str(value).strip()
                 elif isinstance(default, float) and value is not None:
                     value = float(value)
                 card.settings[key] = value if value is not None else default

@@ -1712,6 +1712,19 @@ use **Setup → Load Rate Card**; **View rate card** shows what's loaded.
 defines the format and the BOM sheet formula (qty per sheet, sheet and
 strip weights) and ships only placeholder example values.
 
+**Costing sheet from a BOM.** `quoting/tender_costing.py` prices a
+tender the way the costing sheet does — BOM weights by the sheet formula,
+A. materials at ₹/kg × usage % less scrap, B. processes at card rates,
+C–H others, then margin (the last knob), GST, all-inclusive rate, and the
+margin that would meet the LPR — and `quoting/costing_sheet_xlsx.py`
+writes it in the costing-sheet layout with live formulas. To re-cost an
+old Excel costing against today's rate card:
+
+    python -m quoting.recost OLD_COSTING.xlsx [--match-lpr | --margin 15]
+
+It writes `OLD_COSTING - recosted.xlsx` (costing sheet, consolidated BOM,
+and a comparison with the original) next to the input.
+
 The database is one SQLite file: `~/.local/share/AlphaQuote/quotes.db` on
 Linux/WSL, `%APPDATA%\AlphaQuote\quotes.db` on Windows, or wherever
 `ALPHAQUOTE_DB` points. Use `quote_app/main.py --db PATH` to open a

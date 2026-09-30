@@ -127,6 +127,11 @@ def import_fcstd(paths, kfactor=0.4, tolerance=0.25, min_area=0.0, qty_overrides
             "method": p.get("method", "fcstd"),
             "quantity": p.get("quantity", 1),
             "material": p.get("material"),
+            # Quoting (quoting/features.py) -- carried through untouched,
+            # the nest itself never reads them.
+            "bends": p.get("bends"),
+            "bend_details": p.get("bend_details", []),
+            "hole_features": p.get("hole_features", []),
         }
     unresolved = data.get("unresolved", [])
     skipped = data.get("skipped", [])

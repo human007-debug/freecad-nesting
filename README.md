@@ -1189,6 +1189,7 @@ normal and `mono` form. Suite: 126 tests.
 | `microjoints.py`      | Pure geometry: splits a contour into open polylines with small uncut tab gaps |
 | `remnant.py`          | Pure geometry: largest empty rectangle left on a cut sheet, for automatic remnant capture |
 | `commonline.py`       | Pure geometry: detects/splits exact shared edges between placed parts, for common-line cutting |
+| `native_app/quote_panel.py` | The native app's Quote tab: quote lines, settings, per-quantity cost breakdown with overrides, XLSX export — see "Quoting (Quote tab)" |
 | `quote_demo.py`       | Example: quotes a small welded frame at 1/10/100 sets with the `quoting/` engine and prints the breakdown (`python3 quote_demo.py`) |
 | `bar_nest.py`         | Plain python3: 1D bar/tube/section length nesting (first-fit decreasing + local improvement, kerf and trim ends, remnants) |
 | `quoting/`            | Plain python3, no FreeCAD: AlphaQuote's quoting core — part features, part-type classification, rate tables (SQLite/XLSX), cost-centre operations and the quantity-break quote engine. See `docs/QUOTING_PLAN.md` |
@@ -1659,6 +1660,36 @@ Linux/Python 3.13. Symptom when this is wrong: clicking "Run Nesting..."
 does nothing at all — no dialog, no visible error — because the `import
 nester` chain fails inside `Activated()` before `NestingDialog` is ever
 constructed; check the Report View for `ModuleNotFoundError`.
+
+## Quoting (Quote tab)
+
+The native app's **Quote** tab (`native_app/quote_panel.py`) prices the
+job with the `quoting/` engine — see `docs/QUOTING_PLAN.md`.
+
+1. Add parts on the **Parts** tab as usual; each becomes a sheet line on
+   the Quote tab (FreeCAD imports bring their bend count and tapped holes
+   along). Select a line to fill in what the file can't say — a DXF part's
+   thickness and bend count, tapped holes, paint.
+2. Add anything that isn't a flat part from the ribbon: **Add bought-in
+   part** (unit cost, supplier), **Add tube / section** (profile, cut
+   length, end cuts, bar length and price per metre), **Add welded
+   assembly** (part and fastener count, weld length).
+3. Set the quantities (default 1, 10, 100 sets), markup per cost area,
+   paint and transport on the right, and click **Price Quote**.
+4. The table shows cost, price and price per set for each quantity; pick
+   one to see its breakdown per line and cost centre. Type into any cell
+   to override it (bold; the calculated value stays in its tooltip).
+   **Export Quote** saves everything to `.xlsx`.
+
+Sheet material comes from the stock loaded on the **Stock** tab, re-nested
+at every quantity ("Quick estimate" skips the nest for big jobs). With no
+stock loaded it prices stand-in 3000×1500 sheets at the "Sheet price / kg"
+setting and says so. Rates start as a built-in starter table marked
+"calibrate me": **Export rates...** writes it to Excel, edit in your
+machines' real speeds and hourly rates, and **Load rates...** it back.
+
+`quote_demo.py` runs the same engine without the app and prints the
+result.
 
 ## Native app
 

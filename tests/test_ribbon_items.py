@@ -94,9 +94,9 @@ def test_a_rule_with_nothing_left_to_divide_goes_too(window):
 
 def test_tabs_run_in_the_order_a_job_does(window):
     """Parts, then stock, then the nest's settings with Run at their end,
-    then output -- each step's next step is the next tab over."""
+    then output, then the quote -- each step's next step is the next tab over."""
     titles = [page.title for page in window.ribbon.pages]
-    assert titles == ["Parts", "Stock", "Nesting", "Output", "View"]
+    assert titles == ["Parts", "Stock", "Nesting", "Output", "Quote", "View"]
     nesting = window.ribbon.pages[2]
     assert nesting.groups[-1].title == "Run"
     assert nesting.isAncestorOf(_widget(window, "run"))

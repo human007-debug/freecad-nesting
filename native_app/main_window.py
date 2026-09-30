@@ -5,11 +5,11 @@ The native app's top-level window, laid out as one workspace the way CAM
 nesting suites (Lantek, LaserNest) lay theirs out:
 
 * a tabbed ribbon across the top (ribbon.py -- Parts / Stock / Nesting / Output /
-  View, each a page of captioned groups);
+  Quote / View, each a page of captioned groups);
 * the sheet canvas in the middle -- the shared `nesting_widgets.NestingPanel`
   (backed by a `FilePartSource` instead of a live FreeCAD document), which
   swaps to the stock table (stock_panel.py) while the ribbon's Stock tab is
-  open;
+  open, and to the quote (quote_panel.py) while the Quote tab is;
 * the job's panes docked around it -- Parts list on the left, Layout Results
   on the right, Part Table / Part Details / Log tabbed along the bottom
   (parts_panel.py builds the parts panes) -- movable, closable, and
@@ -44,6 +44,7 @@ from native_app import theme
 from native_app import persistence
 from native_app.file_part_source import FilePartSource
 from native_app.parts_panel import LayoutCardDelegate, PartsPanel
+from native_app.quote_panel import QuotePanel
 from native_app.ribbon import Ribbon
 from native_app.stock_panel import StockPanel
 
@@ -122,6 +123,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.stock_panel = StockPanel(self.panel, self)
         self.parts_panel = PartsPanel(self.panel, self)
+        self.quote_panel = QuotePanel(self.panel, self)
 
         # One workspace, the way CAM nesting suites lay theirs out: the
         # sheet canvas in the middle with the job's panes docked around it
@@ -134,12 +136,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.workspace.setObjectName("Workspace")
         self.workspace.addWidget(self.panel)
         self.workspace.addWidget(self.stock_panel)
+        self.workspace.addWidget(self.quote_panel)
         self.parts_page = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.parts_page.setObjectName("PartsWorkspace")
         self.parts_page.setChildrenCollapsible(False)
         self.workspace.addWidget(self.parts_page)
         self._parts_mode = False
         self._parts_mode_hidden = []
+        self._quote_mode_hidden = None
         self.setCentralWidget(self.workspace)
         self._build_canvas()
         self._build_docks()
@@ -310,7 +314,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.workspace.setCurrentWidget(self.parts_page)
             return
         self._leave_parts_mode()
-        self.workspace.setCurrentWidget(self.stock_panel if title == "Stock" else self.panel)
+        if title == "Quote":
+            self._enter_quote_mode()
+        else:
+            self._leave_quote_mode()
+        pages = {"Stock": self.stock_panel, "Quote": self.quote_panel}
+        self.workspace.setCurrentWidget(pages.get(title, self.panel))
+
+    def _enter_quote_mode(self):
+        """The Quote tab needs the room: the nest's own panes (Layout
+        Results, Part Table / Details, Log) are hidden while it's open and
+        come back as they were when it closes. The Parts list stays."""
+        if self._quote_mode_hidden is not None:
+            return
+        docks = (self.results_dock, self.table_dock, self.details_dock, self.log_dock)
+        self._quote_mode_hidden = [dock for dock in docks if not dock.isHidden()]
+        for dock in docks:
+            dock.hide()
+
+    def _leave_quote_mode(self):
+        if self._quote_mode_hidden is None:
+            return
+        for dock in self._quote_mode_hidden:
+            dock.show()
+        self._quote_mode_hidden = None
 
     def _enter_parts_mode(self):
         """The Parts tab is about the parts, not the nest: the Part Table
@@ -647,6 +674,43 @@ class MainWindow(QtWidgets.QMainWindow):
         # enabled state, flipped all through a run); mirror it.
         self._commit_mirror = _EnabledMirror(panel.commit_btn, commit_btn, self)
 
+        # --------------------------------------------------------- Quote
+        # Prices the job with the quoting/ engine (quote_panel.py); the
+        # center shows the quote lines, settings and breakdown.
+        qp = self.quote_panel
+        quote_tab = ribbon.add_tab("Quote")
+        quote_lines = quote_tab.add_group("Lines")
+        add_bought_btn = quote_lines.add_small("add-parts", "+", "Add bought-in part")
+        add_bought_btn.setToolTip("Add a purchased item (bolts, PEM nuts, hinges...) with its unit cost.")
+        add_bought_btn.clicked.connect(lambda: qp.add_line("purchased"))
+        add_tube_btn = quote_lines.add_small("add-parts", "+", "Add tube / section")
+        add_tube_btn.setToolTip("Add a tube or section member, cut from bar stock.")
+        add_tube_btn.clicked.connect(lambda: qp.add_line("tube"))
+        add_assy_btn = quote_lines.add_small("add-parts", "+", "Add welded assembly")
+        add_assy_btn.setToolTip("Add an assembly line: welding and assembly labour per set.")
+        add_assy_btn.clicked.connect(lambda: qp.add_line("assembly"))
+        quote_lines.new_column()
+        remove_line_btn = quote_lines.add_small("remove-part", "\u2212", "Remove line")
+        remove_line_btn.setToolTip("Remove the selected quote line (parts are removed on the Parts tab).")
+        remove_line_btn.clicked.connect(qp.remove_selected_line)
+
+        quote_rates = quote_tab.add_group("Rates")
+        load_rates_btn = quote_rates.add_small("load-inventory", "\u2b06", "Load rates...")
+        load_rates_btn.setToolTip("Load your shop's rate table (.xlsx or SQLite).")
+        load_rates_btn.clicked.connect(lambda: qp.load_rates_file())
+        export_rates_btn = quote_rates.add_small("export-dxf", "\u2b07", "Export rates...")
+        export_rates_btn.setToolTip("Write the current rate table to .xlsx to edit in Excel.")
+        export_rates_btn.clicked.connect(lambda: qp.export_rates_file())
+
+        quote_run = quote_tab.add_group("Quote")
+        price_btn = quote_run.add_large("run-nesting", "\u25b6", "Price\nQuote", primary=True)
+        price_btn.setToolTip("Price every line at every quantity break (re-nests the job for each).")
+        price_btn.clicked.connect(qp.price)
+        export_quote_btn = quote_run.add_large("report", "\u25a6", "Export\nQuote")
+        export_quote_btn.setToolTip("Save the quote -- summary and breakdown per quantity -- to .xlsx.")
+        export_quote_btn.clicked.connect(lambda: qp.export_xlsx())
+        qp.busy_changed.connect(lambda busy: price_btn.setEnabled(not busy))
+
         # ---------------------------------------------------------- View
         view = ribbon.add_tab("View")
         sheet = view.add_group("Sheet")
@@ -743,6 +807,14 @@ class MainWindow(QtWidgets.QMainWindow):
             ("pane_log", "Log pane", log_btn),
             ("reset_layout", "Reset layout", reset_btn),
             ("dark_mode", "Dark mode", self.dark_mode_btn),
+            ("quote_add_bought", "Add bought-in part", add_bought_btn),
+            ("quote_add_tube", "Add tube / section", add_tube_btn),
+            ("quote_add_assembly", "Add welded assembly", add_assy_btn),
+            ("quote_remove_line", "Remove quote line", remove_line_btn),
+            ("quote_load_rates", "Load rates", load_rates_btn),
+            ("quote_export_rates", "Export rates", export_rates_btn),
+            ("quote_price", "Price quote", price_btn),
+            ("quote_export", "Export quote", export_quote_btn),
         ]
         self.ribbon_items = items
 

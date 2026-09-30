@@ -127,5 +127,10 @@ class FilePartSource:
                 "method": p.get("method", "json"),
                 "quantity": p.get("quantity", 1),
                 "material": p.get("material"),
+                # Quoting (quoting/features.py) -- carried through untouched,
+                # the nest itself never reads them.
+                "bends": p.get("bends"),
+                "bend_details": p.get("bend_details", []),
+                "hole_features": p.get("hole_features", []),
             }
         return extracted

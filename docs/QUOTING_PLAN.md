@@ -4,7 +4,11 @@ A plan for a quoting module modelled on Hexagon RADAN Radquote, built on
 top of the AlphaNest nesting engine and its FreeCAD integration. Status:
 **Phases 1–3 implemented** as the pure-Python `quoting/` package plus
 `bar_nest.py` (tests: `tests/test_quoting_*.py`, `tests/test_bar_nest.py`).
-Phases 4–6 are not started. See "Implementation status" below.
+Phase 4 is partly done: the native app has a Quote tab
+(`native_app/quote_panel.py`). The quote database, customers and
+revisions, assembly expansion from a FreeCAD document, and the FreeCAD
+workbench button are not started; nor are Phases 5–6 (beyond an XLSX
+export). See "Implementation status" below.
 
 ## Implementation status
 
@@ -19,6 +23,7 @@ Phases 4–6 are not started. See "Implementation status" below.
 | 2b.3 tube | `quoting/ops_tube.py`, `bar_nest.py` | Saw or tube laser, end-cut multipliers; bar stock is `bar_nest.BarStock` rather than a new `inventory.py` column. |
 | 2b.4 machining | `quoting/ops_machining.py` | Per-feature, flagged `estimate`. |
 | 2b.5/2b.6 | `quoting/ops_assembly.py`, `RuleOperation` | Assembly labour, bought-in lines, quote-level costs. |
+| Phase 4 Quote tab | `native_app/quote_panel.py` | Lines from the Parts tab plus bought-in, tube and assembly lines; quantity breaks, markups, rates load/export; editable breakdown grid (overrides per quantity); XLSX export. Pricing runs on a worker thread. Quotes aren't saved yet (no database). |
 | Phase 3 costing | `quoting/costing.py` | Real nest per break via `inventory.run_job()` (on a copy of the stock), or a quick utilisation estimate; net-area / bbox allocation; remnant factor; scrap credit; per-area markup; overrides that keep the calculated value. Machined parts take a hand-entered `blank_cost` for material. |
 
 ## 1. What Radquote does (research summary)
